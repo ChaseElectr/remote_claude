@@ -3,15 +3,17 @@
 set -e
 
 # 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+NC=$'\033[0m' # No Color
+
+# 末尾汇总警告
+WARNINGS=()
 
 # 打印函数
 print_info() {
-    echo -e "${BLUE}ℹ${NC} $1"
+    echo -e "${GREEN}ℹ${NC} $1"
 }
 
 print_success() {
@@ -28,9 +30,9 @@ print_error() {
 
 print_header() {
     echo ""
-    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${BLUE}$1${NC}"
-    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}$1${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
 }
 
@@ -122,17 +124,18 @@ check_tmux() {
             install_tmux
             # 升级后再次验证
             if ! check_version; then
-                print_error "升级后版本仍不满足要求（$(tmux -V)），请手动安装 tmux ${REQUIRED_MAJOR}.${REQUIRED_MINOR}+"
-                exit 1
+                print_warning "升级后版本仍不满足要求（$(tmux -V)），请手动安装 tmux ${REQUIRED_MAJOR}.${REQUIRED_MINOR}+"
+                WARNINGS+=("tmux 版本不满足要求（$(tmux -V)），需要 ${REQUIRED_MAJOR}.${REQUIRED_MINOR}+，请手动升级")
+            else
+                print_success "tmux 已升级至 $(tmux -V)"
             fi
-            print_success "tmux 已升级至 $(tmux -V)"
         fi
     else
         print_warning "未找到 tmux，正在安装..."
         install_tmux
         if ! check_version; then
-            print_error "安装的版本不满足要求（$(tmux -V)），请手动安装 tmux ${REQUIRED_MAJOR}.${REQUIRED_MINOR}+"
-            exit 1
+            print_warning "安装的版本不满足要求（$(tmux -V)），请手动安装 tmux ${REQUIRED_MAJOR}.${REQUIRED_MINOR}+"
+            WARNINGS+=("tmux 版本不满足要求（$(tmux -V)），需要 ${REQUIRED_MAJOR}.${REQUIRED_MINOR}+，请手动升级")
         fi
     fi
 }
@@ -285,58 +288,12 @@ show_usage() {
     print_header "安装完成！"
 
     cat << EOF
-Remote Claude 已成功初始化！🎉
+${YELLOW}快捷命令：${NC}
 
-${GREEN}快速开始：${NC}
+  ${GREEN}cla${NC}  - 启动飞书客户端 + 以当前目录+时间戳为会话名启动 Claude
+  ${GREEN}cl${NC}   - 同 cla，但跳过权限确认
 
-  1. 启动一个新会话：
-     ${BLUE}uv run python3 remote_claude.py start <会话名>${NC}
-
-     示例：
-     uv run python3 remote_claude.py start mywork
-
-  2. 从其他终端连接会话：
-     ${BLUE}uv run python3 remote_claude.py attach <会话名>${NC}
-
-  3. 查看所有会话：
-     ${BLUE}uv run python3 remote_claude.py list${NC}
-
-  4. 关闭会话：
-     ${BLUE}uv run python3 remote_claude.py kill <会话名>${NC}
-
-${YELLOW}快捷命令（已安装到系统 bin 目录）：${NC}
-
-  ${BLUE}cla${NC}  - 启动飞书客户端 + 以当前目录+时间戳为会话名启动 Claude
-  ${BLUE}cl${NC}   - 同 cla，但跳过权限确认（适合自动化/受信任场景）
-
-${YELLOW}飞书客户端（可选）：${NC}
-
-  1. 编辑 .env 文件，填写飞书应用凭证
-  2. 启动飞书客户端：
-     ${BLUE}uv run python3 remote_claude.py lark start${NC}
-  3. 管理飞书客户端：
-     ${BLUE}uv run python3 remote_claude.py lark stop/restart/status${NC}
-  4. 在飞书中与机器人对话，使用命令：
-     /attach <会话名>  - 连接会话
-     /detach          - 断开会话
-     /list            - 查看所有会话
-
-${YELLOW}测试：${NC}
-
-  单元测试（无需会话）：
-  ${BLUE}uv run python3 tests/test_format_unit.py${NC}
-
-  集成测试（需先启动会话）：
-  ${BLUE}uv run python3 remote_claude.py start test${NC}
-  ${BLUE}uv run python3 tests/test_integration.py${NC}
-
-${YELLOW}文档：${NC}
-
-  - CLAUDE.md         - 项目架构和开发说明
-  - QUICKSTART.md     - 快速上手指南
-  - TEST_PLAN.md      - 测试计划和场景
-
-${GREEN}祝使用愉快！${NC}
+详细使用说明请阅读 README.md
 
 EOF
 }
@@ -361,6 +318,16 @@ main() {
     configure_shell
     restart_lark_client
     show_usage
+
+    if [ ${#WARNINGS[@]} -gt 0 ]; then
+        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${YELLOW}⚠ 注意事项${NC}"
+        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        for w in "${WARNINGS[@]}"; do
+            echo -e "${YELLOW}⚠${NC} $w"
+        done
+        echo ""
+    fi
 }
 
 # 运行主流程
