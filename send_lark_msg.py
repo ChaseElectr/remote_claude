@@ -9,7 +9,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import os
 
-load_dotenv(Path(__file__).parent / ".env")
+load_dotenv(Path.home() / ".remote-claude" / ".env")
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody

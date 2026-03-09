@@ -119,6 +119,17 @@ class OutputWatcher:
         self.last_window: Optional[ClaudeWindow] = None
         # PTY 静止后延迟重刷：消除窗口平滑的延迟效应
         self._reflush_handle: Optional[asyncio.TimerHandle] = None
+        # 调试日志截断长度（可通过 ~/.remote-claude/.debug_config 配置）
+        self._debug_truncate_len = 80
+        try:
+            cfg_path = os.path.expanduser("~/.remote-claude/.debug_config")
+            if os.path.exists(cfg_path):
+                import json as _json
+                with open(cfg_path) as _f:
+                    _cfg = _json.load(_f)
+                self._debug_truncate_len = int(_cfg.get("debug_truncate_len", 80))
+        except Exception:
+            pass
 
     def resize(self, cols: int, rows: int):
         """重建 renderer 以适应新尺寸，历史随之丢失（可接受）。
@@ -403,7 +414,7 @@ class OutputWatcher:
                         else:
                             lines.append(f"[{i}] UserInput: {block.text[:80]}")
                 else:
-                    lines.append(f"[{i}] {type(block).__name__}: {str(block)[:80]}")
+                    lines.append(f"[{i}] {type(block).__name__}: {str(block)[:self._debug_truncate_len]}")
             lines.append("")
             lines.append("-----")
             with open(self._debug_file, "w", encoding="utf-8") as f:

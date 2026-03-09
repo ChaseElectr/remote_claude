@@ -16,7 +16,28 @@ import uuid
 
 # 常量
 SOCKET_DIR = Path("/tmp/remote-claude")
+USER_DATA_DIR = Path.home() / ".remote-claude"
 TMUX_SESSION_PREFIX = "rc-"
+
+
+def get_env_file() -> Path:
+    """获取 .env 配置文件路径"""
+    return USER_DATA_DIR / ".env"
+
+
+def get_chat_bindings_file() -> Path:
+    """获取飞书聊天绑定持久化文件路径"""
+    return USER_DATA_DIR / "lark_chat_bindings.json"
+
+
+def get_lark_log_file() -> Path:
+    """获取飞书客户端日志文件路径"""
+    return USER_DATA_DIR / "lark_client.log"
+
+
+def ensure_user_data_dir():
+    """确保用户数据目录存在"""
+    USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _safe_filename(session_name: str) -> str:

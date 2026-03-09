@@ -5,8 +5,8 @@
 - build_stream_card(blocks, ...)：从共享内存 blocks 流构建飞书卡片（供 SharedMemoryPoller 调用）
 
 辅助卡片：
-- build_session_list_card / build_status_card / build_help_card
-- build_dir_card / build_menu_card / build_session_closed_card
+- build_menu_card（内嵌会话列表 + 快捷操作，/menu 和 /list 共用）
+- build_status_card / build_help_card / build_dir_card / build_session_closed_card
 """
 
 import logging
@@ -193,7 +193,7 @@ def _build_menu_button_row(session_name: Optional[str] = None, disconnected: boo
     """底部快捷菜单按钮行，用于流式卡片
 
     - 连接状态（session_name 有值, disconnected=False）:
-      返回 [form, collapsible]，form 包含：⚡菜单 + 🔌断开 + spacer + Enter↵，下方输入框
+      返回 [form, collapsible]，form 包含：⚡菜单 + 🔌断开 + spacer + Enter↵，下方输入框；collapsible 包含快捷键
     - 断开状态（disconnected=True）:
       返回 [column_set: ⚡菜单 + 🔗重新连接]，无输入框/Enter/快捷键
     - 无 session_name：保持原逻辑（只有 ⚡菜单 + spacer + Enter↵）
@@ -306,12 +306,6 @@ def _build_menu_button_row(session_name: Optional[str] = None, disconnected: boo
         "width": "fill",
     }
 
-    form = {
-        "tag": "form",
-        "name": "claude_input",
-        "elements": [menu_enter_row, input_box],
-    }
-
     shortcut_keys = [
         ("↑", {"action": "send_key", "key": "up"}),
         ("↓", {"action": "send_key", "key": "down"}),
@@ -330,7 +324,7 @@ def _build_menu_button_row(session_name: Optional[str] = None, disconnected: boo
                 "text": {"tag": "plain_text", "content": label},
                 "type": "default",
                 "width": "fill",
-                "behaviors": [{"type": "callback", "value": value}]
+                "behaviors": [{"type": "callback", "value": value}],
             }]
         }
 
@@ -352,6 +346,12 @@ def _build_menu_button_row(session_name: Optional[str] = None, disconnected: boo
             "title": {"tag": "plain_text", "content": "⌨️ 快捷键"},
         },
         "elements": [row1, row2],
+    }
+
+    form = {
+        "tag": "form",
+        "name": "claude_input",
+        "elements": [menu_enter_row, input_box],
     }
 
     return [form, collapsible]
@@ -376,42 +376,41 @@ def _build_menu_button_only() -> Dict[str, Any]:
 
 
 def _build_buttons_v2(options: List[Dict[str, str]]) -> List[Dict[str, Any]]:
-    """Schema 2.0 按钮组：每行最多 3 个，超出时自动分多行"""
-    MAX_PER_ROW = 3
+    """Schema 2.0 按钮组：每个按钮独占一行，顶部加一条 hr"""
     total = len(options)
-    rows = []
-    for row_start in range(0, total, MAX_PER_ROW):
-        row_opts = options[row_start:row_start + MAX_PER_ROW]
-        columns = []
-        for i, opt in enumerate(row_opts):
-            global_idx = row_start + i
-            btn_type = "primary" if global_idx == 0 else "default"
-            columns.append({
-                "tag": "column",
-                "elements": [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": opt["label"]},
-                        "type": btn_type,
-                        "behaviors": [
-                            {
-                                "type": "callback",
-                                "value": {
-                                    "action": "select_option",
-                                    "value": opt["value"],
-                                    "total": str(total),
-                                }
-                            }
-                        ]
-                    }
-                ]
-            })
-        rows.append({
+    elements = [{"tag": "hr"}]
+    for i, opt in enumerate(options):
+        btn_type = "primary" if i == 0 else "default"
+        elements.append({
             "tag": "column_set",
             "flex_mode": "none",
-            "columns": columns
+            "columns": [
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "horizontal_align": "left",
+                    "elements": [
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": f"{i+1}. {opt['label']}"},
+                            "type": btn_type,
+                            "behaviors": [
+                                {
+                                    "type": "callback",
+                                    "value": {
+                                        "action": "select_option",
+                                        "value": opt["value"],
+                                        "total": str(total),
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
         })
-    return rows
+    return elements
 
 
 # === 流式卡片构建（主入口）===
@@ -523,6 +522,22 @@ def _render_block_colored(block_dict: dict) -> Optional[str]:
     return None
 
 
+def _render_plan_block(block_dict: dict) -> Optional[Dict[str, Any]]:
+    """将 PlanBlock 渲染为飞书 collapsible_panel element"""
+    content = block_dict.get("content", "")
+    if not content:
+        return None
+    title = block_dict.get("title", "计划")
+    ansi_content = block_dict.get("ansi_content", "")
+    content_md = _ansi_to_lark_md(ansi_content) if ansi_content else _escape_md(content)
+    return {
+        "tag": "collapsible_panel",
+        "expanded": True,
+        "header": {"title": {"tag": "plain_text", "content": f"📋 {title}"}},
+        "elements": [{"tag": "markdown", "content": content_md}],
+    }
+
+
 def _determine_header(
     blocks: List[dict],
     status_line: Optional[dict],
@@ -610,6 +625,13 @@ def build_stream_card(
     has_content = False
 
     for block_dict in blocks:
+        typ = block_dict.get("_type", "")
+        if typ == "PlanBlock":
+            plan_el = _render_plan_block(block_dict)
+            if plan_el:
+                has_content = True
+                elements.append(plan_el)
+            continue
         rendered = _render_block_colored(block_dict)
         if rendered:
             has_content = True
@@ -710,10 +732,10 @@ def build_stream_card(
 
 # === 辅助卡片（保留不变）===
 
-def build_session_list_card(sessions: List[Dict], current_session: Optional[str] = None, session_groups: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-    """构建会话列表卡片（带 Attach / New-Group 操作按钮）"""
+def _build_session_list_elements(sessions: List[Dict], current_session: Optional[str], session_groups: Optional[Dict[str, str]]) -> List[Dict]:
+    """构建会话列表元素（供 build_menu_card 复用）"""
+    import os
     elements = []
-
     if sessions:
         for s in sessions:
             name = s["name"]
@@ -721,10 +743,8 @@ def build_session_list_card(sessions: List[Dict], current_session: Optional[str]
             start_time = s.get("start_time", "")
             is_current = (name == current_session)
 
-            # 标题行：会话名 + 当前标记
             status_icon = "🟢" if is_current else "⚪"
             current_label = "（当前）" if is_current else ""
-            # 纯展示用短名：优先取 cwd 最后一级目录名，否则直接用 name
             if cwd:
                 short_name = cwd.rstrip("/").rsplit("/", 1)[-1] or name
             else:
@@ -733,7 +753,6 @@ def build_session_list_card(sessions: List[Dict], current_session: Optional[str]
             if start_time:
                 meta_parts.append(f"启动：{start_time}")
             if cwd:
-                import os
                 home = os.path.expanduser("~")
                 display_cwd = cwd.replace(home, "~")
                 if len(display_cwd) > 40:
@@ -816,19 +835,7 @@ def build_session_list_card(sessions: List[Dict], current_session: Optional[str]
             "tag": "markdown",
             "content": "暂无可用会话\n\n请先在终端启动：`python remote_claude.py start <名称>`"
         })
-
-    elements.append({"tag": "hr"})
-    elements.append(_build_menu_button_only())
-
-    return {
-        "schema": "2.0",
-        "config": {"wide_screen_mode": True},
-        "header": {
-            "title": {"tag": "plain_text", "content": "📋 可用会话"},
-            "template": "blue",
-        },
-        "body": {"elements": elements}
-    }
+    return elements
 
 
 def build_status_card(connected: bool, session_name: Optional[str] = None) -> Dict[str, Any]:
@@ -1069,52 +1076,16 @@ def build_session_closed_card(session_name: str) -> Dict[str, Any]:
     }
 
 
-def build_menu_card(sessions: List[Dict], current_session: Optional[str] = None) -> Dict[str, Any]:
-    """构建快捷操作菜单卡片（/menu）"""
+def build_menu_card(sessions: List[Dict], current_session: Optional[str] = None,
+                    session_groups: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """构建快捷操作菜单卡片（/menu 和 /list 共用）：内嵌会话列表 + 快捷操作"""
     elements = []
 
-    if current_session:
-        status_text = f"🟢 当前连接：**{current_session}**"
-    else:
-        status_text = "⚪ 未连接任何会话"
-    elements.append({"tag": "markdown", "content": status_text})
-    elements.append({"tag": "hr"})
-
     elements.append({"tag": "markdown", "content": "**会话管理**"})
-    row1_buttons = []
+    elements.extend(_build_session_list_elements(sessions, current_session, session_groups))
 
-    if current_session:
-        row1_buttons.append({
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": "🔌 断开连接"},
-            "type": "danger",
-            "behaviors": [{"type": "callback", "value": {"action": "menu_detach"}}]
-        })
-    else:
-        if sessions:
-            first_session = sessions[0]["name"]
-            row1_buttons.append({
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": f"⚡ 连接 {first_session}"},
-                "type": "primary",
-                "behaviors": [{"type": "callback", "value": {
-                    "action": "list_attach", "session": first_session
-                }}]
-            })
-
-    row1_buttons.append({
-        "tag": "button",
-        "text": {"tag": "plain_text", "content": "📋 会话列表"},
-        "type": "default",
-        "behaviors": [{"type": "callback", "value": {"action": "menu_list"}}]
-    })
-    row1_buttons.append({
-        "tag": "button",
-        "text": {"tag": "plain_text", "content": "📖 帮助"},
-        "type": "default",
-        "behaviors": [{"type": "callback", "value": {"action": "menu_help"}}]
-    })
-
+    elements.append({"tag": "hr"})
+    elements.append({"tag": "markdown", "content": "**快捷操作**"})
     elements.append({
         "tag": "column_set",
         "flex_mode": "none",
@@ -1123,39 +1094,37 @@ def build_menu_card(sessions: List[Dict], current_session: Optional[str] = None)
                 "tag": "column",
                 "width": "weighted",
                 "weight": 1,
-                "elements": [btn]
-            }
-            for btn in row1_buttons
+                "elements": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "📖 帮助"},
+                    "type": "default",
+                    "behaviors": [{"type": "callback", "value": {"action": "menu_help"}}]
+                }]
+            },
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "📂 文件列表"},
+                    "type": "default",
+                    "behaviors": [{"type": "callback", "value": {"action": "menu_ls"}}]
+                }]
+            },
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "🌲 目录树"},
+                    "type": "default",
+                    "behaviors": [{"type": "callback", "value": {"action": "menu_tree"}}]
+                }]
+            },
         ]
     })
-
-    elements.append({"tag": "hr"})
-    elements.append({"tag": "markdown", "content": "**目录浏览**"})
-    dir_columns = [
-        {
-            "tag": "column",
-            "width": "weighted",
-            "weight": 1,
-            "elements": [{
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "📂 查看文件列表"},
-                "type": "default",
-                "behaviors": [{"type": "callback", "value": {"action": "menu_ls"}}]
-            }]
-        },
-        {
-            "tag": "column",
-            "width": "weighted",
-            "weight": 1,
-            "elements": [{
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "🌲 查看目录树"},
-                "type": "default",
-                "behaviors": [{"type": "callback", "value": {"action": "menu_tree"}}]
-            }]
-        },
-    ]
-    elements.append({"tag": "column_set", "flex_mode": "none", "columns": dir_columns})
 
     return {
         "schema": "2.0",

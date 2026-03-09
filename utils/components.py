@@ -147,5 +147,19 @@ class AgentPanelBlock:
     ansi_raw: str = ""
 
 
+@dataclass
+class PlanBlock:
+    """计划块（╭│╰ box-drawing 框线包裹的结构化计划内容）
+
+    累积型 Block：出现在输出区，保留在 blocks 历史列表中。
+    Claude CLI Plan Mode 显示的计划内容。
+    """
+    title: str           # 框内第一行非空文本（如 "Plan to implement"）
+    content: str         # 框内完整内容（去掉边框字符，\\n 连接）
+    is_streaming: bool = False  # 始终为 False（╭ 不 blink）
+    start_row: int = -1
+    ansi_content: str = ""
+
+
 # 所有组件类型的联合类型
-Component = Union[OutputBlock, TextBlock, UserInput, ToolCall, AgentBlock, OptionBlock, PermissionBlock, StatusLine, Divider, BottomBar, AgentPanelBlock]
+Component = Union[OutputBlock, TextBlock, UserInput, ToolCall, AgentBlock, OptionBlock, PermissionBlock, StatusLine, Divider, BottomBar, AgentPanelBlock, PlanBlock]

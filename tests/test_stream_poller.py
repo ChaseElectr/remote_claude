@@ -656,6 +656,93 @@ class TestBuildStreamCard(unittest.TestCase):
         agent_texts = [e for e in elements if e.get("tag") == "markdown" and "🤖" in e.get("content", "")]
         self.assertEqual(len(agent_texts), 0)
 
+    def test_plan_block_renders_as_collapsible(self):
+        """PlanBlock 渲染为 collapsible_panel"""
+        blocks = [
+            {"_type": "PlanBlock", "title": "实现计划", "content": "1. 分析需求\n2. 编写代码\n3. 测试"},
+        ]
+        card = build_stream_card(blocks)
+        elements = card["body"]["elements"]
+        # 过滤 PlanBlock 产生的折叠面板（header 含 📋）
+        plan_panels = [
+            e for e in elements
+            if e.get("tag") == "collapsible_panel"
+            and "📋" in e.get("header", {}).get("title", {}).get("content", "")
+        ]
+        self.assertEqual(len(plan_panels), 1)
+        panel = plan_panels[0]
+        self.assertTrue(panel.get("expanded"))
+        self.assertIn("📋 实现计划", panel["header"]["title"]["content"])
+        inner_mds = [e for e in panel.get("elements", []) if e.get("tag") == "markdown"]
+        self.assertEqual(len(inner_mds), 1)
+        self.assertIn("分析需求", inner_mds[0]["content"])
+
+    def test_plan_block_with_ansi(self):
+        """PlanBlock 含 ansi_content 时正确转换为飞书 markdown 着色"""
+        blocks = [
+            {
+                "_type": "PlanBlock",
+                "title": "计划",
+                "content": "step1",
+                "ansi_content": "step1",  # 无 ANSI 转义，直接当普通文本
+            }
+        ]
+        card = build_stream_card(blocks)
+        elements = card["body"]["elements"]
+        plan_panels = [
+            e for e in elements
+            if e.get("tag") == "collapsible_panel"
+            and "📋" in e.get("header", {}).get("title", {}).get("content", "")
+        ]
+        self.assertEqual(len(plan_panels), 1)
+        inner_content = plan_panels[0]["elements"][0]["content"]
+        self.assertIn("step1", inner_content)
+
+    def test_plan_block_empty_content_skipped(self):
+        """空 PlanBlock（无 content）不渲染"""
+        blocks = [
+            {"_type": "PlanBlock", "title": "空计划", "content": ""},
+            {"_type": "OutputBlock", "content": "正常输出", "indicator": "●"},
+        ]
+        card = build_stream_card(blocks)
+        elements = card["body"]["elements"]
+        plan_panels = [
+            e for e in elements
+            if e.get("tag") == "collapsible_panel"
+            and "📋" in e.get("header", {}).get("title", {}).get("content", "")
+        ]
+        self.assertEqual(len(plan_panels), 0)
+        md_elements = [e for e in elements if e.get("tag") == "markdown"]
+        self.assertTrue(any("正常输出" in e.get("content", "") for e in md_elements))
+
+    def test_plan_block_mixed_with_output(self):
+        """PlanBlock 与 OutputBlock 混合渲染：顺序正确"""
+        blocks = [
+            {"_type": "UserInput", "text": "请做计划"},
+            {"_type": "PlanBlock", "title": "实现方案", "content": "步骤一\n步骤二"},
+            {"_type": "OutputBlock", "content": "好的，开始执行", "indicator": "●"},
+        ]
+        card = build_stream_card(blocks)
+        elements = card["body"]["elements"]
+        # 应有 1 个 PlanBlock collapsible_panel（header 含 📋）
+        plan_panels = [
+            e for e in elements
+            if e.get("tag") == "collapsible_panel"
+            and "📋" in e.get("header", {}).get("title", {}).get("content", "")
+        ]
+        self.assertEqual(len(plan_panels), 1)
+        # 应有至少 2 个 markdown（UserInput + OutputBlock）
+        md_elements = [e for e in elements if e.get("tag") == "markdown"]
+        self.assertGreaterEqual(len(md_elements), 2)
+        # UserInput 应在 PlanBlock 之前（在 elements 列表中位置更靠前）
+        md_pos = next(i for i, e in enumerate(elements) if e.get("tag") == "markdown")
+        panel_pos = next(
+            i for i, e in enumerate(elements)
+            if e.get("tag") == "collapsible_panel"
+            and "📋" in e.get("header", {}).get("title", {}).get("content", "")
+        )
+        self.assertLess(md_pos, panel_pos)
+
 
 class TestRenderAgentPanel(unittest.TestCase):
     """测试 _render_agent_panel 各模式"""

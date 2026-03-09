@@ -5,6 +5,7 @@
 使用 pyte Screen 模拟真实终端输出。
 """
 
+import re
 import sys
 from pathlib import Path
 
@@ -1445,6 +1446,270 @@ class TestOptionBlockParser:
         return self.failed == 0
 
 
+class TestPlanBlockParser:
+    """PlanBlock 解析测试（Plan Mode box-drawing 框线）"""
+
+    def __init__(self):
+        self.passed = 0
+        self.failed = 0
+        self.errors = []
+
+    def _pass(self, name):
+        self.passed += 1
+        print(f"  ✓ {name}")
+
+    def _fail(self, name, msg=""):
+        self.failed += 1
+        self.errors.append(f"{name}: {msg}")
+        print(f"  ✗ {name}: {msg}")
+
+    def _make_parser_and_screen(self, text, cols=220, lines=50):
+        """创建 ScreenParser 和 pyte Screen"""
+        sys.path.insert(0, str(Path(__file__).parent.parent / 'server'))
+        from component_parser import ScreenParser
+        screen = pyte.Screen(cols, lines)
+        stream = pyte.Stream(screen)
+        stream.feed(text)
+        parser = ScreenParser()
+        return parser, screen
+
+    def test_basic_plan_block(self):
+        """基础 PlanBlock 解析"""
+        from utils.components import PlanBlock as PB
+        divider = '─' * 80
+        text = (
+            '╭──────────────────────────────────╮\r\n'
+            '│ Plan to implement                │\r\n'
+            '│                                  │\r\n'
+            '│ 1. Step one                      │\r\n'
+            '│ 2. Step two                      │\r\n'
+            '╰──────────────────────────────────╯\r\n'
+            f'{divider}\r\n'
+            '❯ \r\n'
+            f'{divider}\r\n'
+            '▶▶ bypass permissions on\r\n'
+        )
+        parser, screen = self._make_parser_and_screen(text)
+        components = parser.parse(screen)
+
+        plans = [c for c in components if isinstance(c, PB)]
+        if len(plans) != 1:
+            self._fail("basic_plan_block",
+                       f"应有1个 PlanBlock，实际 {len(plans)}: {[type(c).__name__ for c in components]}")
+            return
+        pb = plans[0]
+        if pb.title != 'Plan to implement':
+            self._fail("basic_plan_block", f"title 不对: {pb.title!r}")
+            return
+        if 'Step one' not in pb.content:
+            self._fail("basic_plan_block", f"content 缺少 Step one: {pb.content!r}")
+            return
+        if 'Step two' not in pb.content:
+            self._fail("basic_plan_block", f"content 缺少 Step two: {pb.content!r}")
+            return
+        if pb.is_streaming:
+            self._fail("basic_plan_block", "PlanBlock.is_streaming 应始终为 False")
+            return
+        self._pass("basic_plan_block")
+
+    def test_plan_block_no_border_in_content(self):
+        """PlanBlock 内容中不应包含边框字符"""
+        from utils.components import PlanBlock as PB
+        text = (
+            '╭────────────╮\r\n'
+            '│ Title line │\r\n'
+            '│ Content    │\r\n'
+            '╰────────────╯\r\n'
+        )
+        parser, screen = self._make_parser_and_screen(text)
+        components = parser.parse(screen)
+
+        plans = [c for c in components if isinstance(c, PB)]
+        if len(plans) != 1:
+            self._fail("plan_block_no_border_in_content",
+                       f"应有1个 PlanBlock，实际 {len(plans)}")
+            return
+        pb = plans[0]
+        # content 和 ansi_content 中均不应有边框字符
+        for char in '╭╰╮╯│┃║':
+            if char in pb.content:
+                self._fail("plan_block_no_border_in_content",
+                           f"content 中含边框字符 {char!r}: {pb.content!r}")
+                return
+        ansi_stripped = re.sub(r'\x1b\[[0-9;]*m', '', getattr(pb, 'ansi_content', '') or '')
+        for char in '│┃║':
+            if char in ansi_stripped:
+                self._fail("plan_block_no_border_in_content",
+                           f"ansi_content 中含边框字符 {char!r}: {ansi_stripped!r}")
+                return
+        self._pass("plan_block_no_border_in_content")
+
+    def test_plan_block_block_id_prefix(self):
+        """PlanBlock block_id 应以 PL: 为前缀"""
+        sys.path.insert(0, str(Path(__file__).parent.parent / 'server'))
+        from shared_state import _block_id_from_dict
+        d = {
+            '_type': 'PlanBlock',
+            'title': 'My plan title',
+            'content': 'Step 1\nStep 2',
+            'is_streaming': False,
+            'start_row': 0,
+            'ansi_content': '',
+        }
+        block_id = _block_id_from_dict(d)
+        if not block_id.startswith('PL:'):
+            self._fail("plan_block_block_id_prefix",
+                       f"block_id 应以 PL: 开头，实际: {block_id!r}")
+            return
+        if 'My plan title' not in block_id:
+            self._fail("plan_block_block_id_prefix",
+                       f"block_id 应含 title，实际: {block_id!r}")
+            return
+        self._pass("plan_block_block_id_prefix")
+
+    def test_incomplete_box_no_bottom(self):
+        """不完整 box（无 ╰）也应产出 PlanBlock"""
+        from utils.components import PlanBlock as PB
+        text = (
+            '╭────────────╮\r\n'
+            '│ Partial    │\r\n'
+            '│ Content    │\r\n'
+        )
+        parser, screen = self._make_parser_and_screen(text)
+        components = parser.parse(screen)
+
+        plans = [c for c in components if isinstance(c, PB)]
+        if len(plans) != 1:
+            self._fail("incomplete_box_no_bottom",
+                       f"应有1个 PlanBlock，实际 {len(plans)}: {[type(c).__name__ for c in components]}")
+            return
+        pb = plans[0]
+        if 'Partial' not in pb.content or 'Content' not in pb.content:
+            self._fail("incomplete_box_no_bottom", f"content 内容不正确: {pb.content!r}")
+            return
+        self._pass("incomplete_box_no_bottom")
+
+    def test_plan_block_followed_by_output_block(self):
+        """PlanBlock 后面的 OutputBlock 不受影响"""
+        from utils.components import PlanBlock as PB, OutputBlock as OB
+        divider = '─' * 80
+        text = (
+            '╭────────────────╮\r\n'
+            '│ Plan to fix    │\r\n'
+            '╰────────────────╯\r\n'
+            '⏺ 好的，按照计划执行。\r\n'
+            f'{divider}\r\n'
+            '❯ \r\n'
+            f'{divider}\r\n'
+            '▶▶ bypass permissions on\r\n'
+        )
+        parser, screen = self._make_parser_and_screen(text)
+        components = parser.parse(screen)
+
+        plans = [c for c in components if isinstance(c, PB)]
+        outputs = [c for c in components if isinstance(c, OB)]
+        if len(plans) != 1:
+            self._fail("plan_block_followed_by_output_block",
+                       f"应有1个 PlanBlock，实际 {len(plans)}")
+            return
+        if len(outputs) != 1:
+            self._fail("plan_block_followed_by_output_block",
+                       f"应有1个 OutputBlock，实际 {len(outputs)}: {[type(c).__name__ for c in components]}")
+            return
+        if '按照计划执行' not in outputs[0].content:
+            self._fail("plan_block_followed_by_output_block",
+                       f"OutputBlock 内容不对: {outputs[0].content!r}")
+            return
+        self._pass("plan_block_followed_by_output_block")
+
+    def test_welcome_box_not_parsed_as_plan_block(self):
+        """欢迎框不应被解析为 PlanBlock"""
+        from utils.components import PlanBlock as PB, OutputBlock
+        divider = '─' * 80
+        text = (
+            '╭─── Claude Code v2.1.63 ──────────────────────────────────────╮\r\n'
+            '│                            │ Tips for getting started         │\r\n'
+            '│        Welcome back!       │ Use claude to get started        │\r\n'
+            '╰──────────────────────────────────────────────────────────────╯\r\n'
+            '\r\n'
+            '● Here is a response\r\n'
+            f'{divider}\r\n'
+            '❯ \r\n'
+            f'{divider}\r\n'
+            '▶▶ bypass permissions on\r\n'
+        )
+        parser, screen = self._make_parser_and_screen(text)
+        components = parser.parse(screen)
+
+        plans = [c for c in components if isinstance(c, PB)]
+        if plans:
+            self._fail("welcome_box_not_parsed_as_plan_block",
+                       f"欢迎框不应被解析为 PlanBlock，实际解析出 {len(plans)} 个")
+            return
+
+        outputs = [c for c in components if isinstance(c, OutputBlock)]
+        if not outputs:
+            self._fail("welcome_box_not_parsed_as_plan_block",
+                       f"应有 OutputBlock，实际: {[type(c).__name__ for c in components]}")
+            return
+
+        self._pass("welcome_box_not_parsed_as_plan_block")
+
+    def test_plan_block_content_key(self):
+        """components_content_key 能正确处理 PlanBlock"""
+        sys.path.insert(0, str(Path(__file__).parent.parent / 'server'))
+        from component_parser import ScreenParser, components_content_key
+        from utils.components import PlanBlock as PB
+
+        text = (
+            '╭──────────────╮\r\n'
+            '│ My plan      │\r\n'
+            '╰──────────────╯\r\n'
+        )
+        parser, screen = self._make_parser_and_screen(text)
+        components = parser.parse(screen)
+
+        key = components_content_key(components)
+        if 'PL:' not in key:
+            self._fail("plan_block_content_key",
+                       f"components_content_key 应含 PL: 前缀，实际: {key!r}")
+            return
+        self._pass("plan_block_content_key")
+
+    def run_all(self):
+        """运行所有 PlanBlock 测试"""
+        print()
+        print("=" * 60)
+        print("PlanBlock 解析测试（Plan Mode box-drawing 框线）")
+        print("=" * 60)
+
+        tests = [
+            self.test_basic_plan_block,
+            self.test_plan_block_no_border_in_content,
+            self.test_plan_block_block_id_prefix,
+            self.test_incomplete_box_no_bottom,
+            self.test_plan_block_followed_by_output_block,
+            self.test_plan_block_content_key,
+            self.test_welcome_box_not_parsed_as_plan_block,
+        ]
+
+        for test in tests:
+            try:
+                test()
+            except Exception as e:
+                import traceback
+                self._fail(test.__name__, f"异常: {e}\n{traceback.format_exc()}")
+
+        print()
+        print(f"结果: {self.passed} 通过, {self.failed} 失败, 共 {self.passed + self.failed} 个测试")
+        if self.errors:
+            print(f"\n失败详情:")
+            for err in self.errors:
+                print(f"  - {err}")
+
+        return self.failed == 0
+
+
 if __name__ == "__main__":
     # 运行旧版测试（可能因 import 路径问题跳过）
     success1 = True
@@ -1466,4 +1731,8 @@ if __name__ == "__main__":
     runner3 = TestOptionBlockParser()
     success3 = runner3.run_all()
 
-    sys.exit(0 if (success1 and success2 and success3) else 1)
+    # 运行 PlanBlock 测试
+    runner4 = TestPlanBlockParser()
+    success4 = runner4.run_all()
+
+    sys.exit(0 if (success1 and success2 and success3 and success4) else 1)

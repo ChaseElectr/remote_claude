@@ -77,6 +77,8 @@ def _block_id_from_dict(d: dict) -> str:
         elif pt == 'summary':
             return f"AP:summary:{d.get('agent_count', 0)}"
         return f"AP:list:{d.get('agent_count', 0)}"
+    elif t == 'PlanBlock':
+        return f"PL:{d.get('title', '')[:80]}"
     return ""
 
 
@@ -163,42 +165,34 @@ class SharedStateWriter:
 # ── Reader ────────────────────────────────────────────────────────────────────
 
 class SharedStateReader:
-    """读端：其他进程持有，按需调用 read() 获取最新快照"""
+    """读端：其他进程持有，按需调用 read() 获取最新快照。
+
+    使用直接文件 I/O 而非 mmap，避免 macOS 上 mmap ACCESS_READ 不可靠地
+    反映跨进程写入更新的问题。每次 read() 打开文件读取后关闭，保证读到最新数据。
+    """
+
+    _EMPTY = {"blocks": [], "status_line": None, "bottom_bar": None, "option_block": None}
 
     def __init__(self, session_name: str):
-        path = get_mq_path(session_name)
-        self._f = open(path, 'rb')
-        self._mm = mmap.mmap(self._f.fileno(), MMAP_SIZE, access=mmap.ACCESS_READ)
+        self._path = get_mq_path(session_name)
 
     def read(self) -> dict:
         """读取当前完整快照，返回 dict"""
-        mm = self._mm
-
-        # 校验 magic
-        mm.seek(HEADER_OFFSET)
-        if mm.read(4) != MAGIC:
-            return {"blocks": [], "status_line": None, "bottom_bar": None, "option_block": None}
-
-        # 校验版本
-        version = struct.unpack('>I', mm.read(4))[0]
-        if version < 2:
-            return {"blocks": [], "status_line": None, "bottom_bar": None, "option_block": None}
-
-        # 读 snapshot_len + sequence
-        snapshot_len, sequence = struct.unpack('>II', mm.read(8))
-        if snapshot_len == 0:
-            return {"blocks": [], "status_line": None, "bottom_bar": None, "option_block": None}
-
-        # 读快照 JSON
-        mm.seek(COMPLETED_OFFSET)
         try:
-            return json.loads(mm.read(snapshot_len).decode('utf-8'))
+            with open(self._path, 'rb') as f:
+                header = f.read(16)
+                if len(header) < 16 or header[:4] != MAGIC:
+                    return self._EMPTY
+                version = struct.unpack('>I', header[4:8])[0]
+                if version < 2:
+                    return self._EMPTY
+                snapshot_len, _sequence = struct.unpack('>II', header[8:16])
+                if snapshot_len == 0:
+                    return self._EMPTY
+                f.seek(COMPLETED_OFFSET)
+                return json.loads(f.read(snapshot_len).decode('utf-8'))
         except Exception:
-            return {"blocks": [], "status_line": None, "bottom_bar": None, "option_block": None}
+            return self._EMPTY
 
     def close(self):
-        try:
-            self._mm.close()
-            self._f.close()
-        except Exception:
-            pass
+        pass  # 无持久资源需要释放

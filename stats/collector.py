@@ -18,8 +18,19 @@ from typing import Optional
 from .machine import get_machine_id, get_machine_info
 
 # SQLite 数据库路径（持久化，不受 /tmp 清理影响）
-_DB_DIR = Path.home() / ".local" / "share" / "remote-claude"
+_DB_DIR = Path.home() / ".remote-claude"
 _DB_PATH = _DB_DIR / "stats.db"
+_OLD_DB_DIR = Path.home() / ".local" / "share" / "remote-claude"
+_OLD_DB_PATH = _OLD_DB_DIR / "stats.db"
+
+# 兼容迁移：旧 DB 存在而新路径不存在时，自动迁移
+if not _DB_PATH.exists() and _OLD_DB_PATH.exists():
+    try:
+        import shutil as _shutil
+        _DB_DIR.mkdir(parents=True, exist_ok=True)
+        _shutil.move(str(_OLD_DB_PATH), str(_DB_PATH))
+    except Exception:
+        pass
 
 # 批量写入阈值
 _FLUSH_INTERVAL = 10.0   # 秒

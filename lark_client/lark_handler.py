@@ -22,17 +22,16 @@ from .session_bridge import SessionBridge
 from .card_service import card_service
 from .card_builder import (
     build_stream_card,
-    build_session_list_card,
     build_status_card,
     build_help_card,
     build_dir_card,
     build_menu_card,
     build_session_closed_card,
 )
-from .shared_memory_poller import SharedMemoryPoller
+from .shared_memory_poller import SharedMemoryPoller, CardSlice
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from utils.session import list_active_sessions, get_socket_path
+from utils.session import list_active_sessions, get_socket_path, get_chat_bindings_file, ensure_user_data_dir
 
 try:
     from stats import track as _track_stats
@@ -43,9 +42,18 @@ except Exception:
 class LarkHandler:
     """飞书消息处理器（群聊/私聊统一逻辑）"""
 
-    _CHAT_BINDINGS_FILE = Path("/tmp/remote-claude/lark_chat_bindings.json")
+    _CHAT_BINDINGS_FILE = get_chat_bindings_file()
+    _OLD_CHAT_BINDINGS_FILE = Path("/tmp/remote-claude/lark_chat_bindings.json")
 
     def __init__(self):
+        # 兼容迁移：旧绑定文件存在而新路径不存在时，自动迁移
+        if not self._CHAT_BINDINGS_FILE.exists() and self._OLD_CHAT_BINDINGS_FILE.exists():
+            try:
+                import shutil
+                ensure_user_data_dir()
+                shutil.move(str(self._OLD_CHAT_BINDINGS_FILE), str(self._CHAT_BINDINGS_FILE))
+            except Exception as e:
+                logger.warning(f"迁移旧绑定文件失败: {e}")
         # chat_id → SessionBridge（活跃连接）
         self._bridges: Dict[str, SessionBridge] = {}
         # chat_id → session_name（当前连接状态）
@@ -54,6 +62,8 @@ class LarkHandler:
         self._poller = SharedMemoryPoller(card_service)
         # chat_id → session_name 持久化绑定（重启后自动恢复）
         self._chat_bindings: Dict[str, str] = self._load_chat_bindings()
+        # chat_id → CardSlice（用户主动断开后保留，供重连时冻结旧卡片）
+        self._detached_slices: Dict[str, CardSlice] = {}
 
     # ── 持久化绑定 ──────────────────────────────────────────────────────────
 
@@ -67,7 +77,7 @@ class LarkHandler:
 
     def _save_chat_bindings(self):
         try:
-            self._CHAT_BINDINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            ensure_user_data_dir()
             self._CHAT_BINDINGS_FILE.write_text(
                 json.dumps(self._chat_bindings, ensure_ascii=False)
             )
@@ -88,6 +98,7 @@ class LarkHandler:
             await old.disconnect()
         self._poller.stop(chat_id)
         self._chat_sessions.pop(chat_id, None)
+        self._detached_slices.pop(chat_id, None)
 
         def on_disconnect():
             asyncio.create_task(self._on_disconnect(chat_id, session_name))
@@ -115,11 +126,24 @@ class LarkHandler:
         logger.info(f"会话 '{session_name}' 断线, chat_id={chat_id[:8]}...")
         _track_stats('lark', 'disconnect', session_name=session_name,
                      chat_id=chat_id)
+        active_slice = self._poller.stop_and_get_active_slice(chat_id)
         self._bridges.pop(chat_id, None)
         self._chat_sessions.pop(chat_id, None)
-        self._poller.stop(chat_id)
+        self._detached_slices.pop(chat_id, None)
         self._remove_binding_by_chat(chat_id)
+
         card = build_session_closed_card(session_name)
+        if active_slice:
+            try:
+                success = await card_service.update_card(
+                    card_id=active_slice.card_id,
+                    sequence=active_slice.sequence + 1,
+                    card_content=card,
+                )
+                if success:
+                    return
+            except Exception as e:
+                logger.warning(f"_on_disconnect 就地更新失败: {e}")
         await card_service.create_and_send_card(chat_id, card)
 
     # ── 消息入口 ────────────────────────────────────────────────────────────
@@ -131,12 +155,24 @@ class LarkHandler:
         text = text.strip()
 
         if text.startswith("/"):
-            await self._handle_command(user_id, chat_id, text)
-        else:
-            await self._forward_to_claude(user_id, chat_id, text)
-            _track_stats('lark', 'message',
-                         session_name=self._chat_sessions.get(chat_id, ''),
-                         chat_id=chat_id)
+            # /cl 前缀：去掉前缀，转发给 Claude
+            if text == "/cl" or text.startswith("/cl "):
+                claude_text = text[3:].strip()
+                if claude_text:
+                    await self._forward_to_claude(user_id, chat_id, claude_text)
+                    _track_stats('lark', 'message',
+                                 session_name=self._chat_sessions.get(chat_id, ''),
+                                 chat_id=chat_id)
+            else:
+                await self._handle_command(user_id, chat_id, text)
+        # else: 普通聊天消息（无 /cl 前缀），不再转发给 Claude
+
+    async def forward_to_claude(self, user_id: str, chat_id: str, text: str):
+        """卡片输入框直通 Claude（跳过命令路由）"""
+        await self._forward_to_claude(user_id, chat_id, text)
+        _track_stats('lark', 'message',
+                     session_name=self._chat_sessions.get(chat_id, ''),
+                     chat_id=chat_id)
 
     async def _handle_command(self, user_id: str, chat_id: str, text: str):
         """处理命令（群聊/私聊共用同一逻辑）"""
@@ -172,18 +208,13 @@ class LarkHandler:
 
     # ── 命令处理 ─────────────────────────────────────────────────────────────
 
-    async def _cmd_attach(self, user_id: str, chat_id: str, args: str):
+    async def _cmd_attach(self, user_id: str, chat_id: str, args: str,
+                          message_id: Optional[str] = None):
         """连接到会话"""
         session_name = args.strip()
 
         if not session_name:
-            sessions = list_active_sessions()
-            current = self._chat_sessions.get(chat_id)
-            session_groups = {sname: cid for cid, sname in self._chat_bindings.items() if cid.startswith("oc_")}
-            card = build_session_list_card(sessions, current, session_groups=session_groups)
-            card_id = await card_service.create_card(card)
-            if card_id:
-                await card_service.send_card(chat_id, card_id)
+            await self._cmd_list(user_id, chat_id, message_id=message_id)
             return
 
         sessions = list_active_sessions()
@@ -197,7 +228,8 @@ class LarkHandler:
         if ok:
             self._chat_bindings[chat_id] = session_name
             self._save_chat_bindings()
-            await card_service.send_text(chat_id, f"✅ 已连接到会话 '{session_name}'")
+            if message_id:
+                await self._cmd_list(user_id, chat_id, message_id=message_id)
         else:
             await card_service.send_text(chat_id, f"❌ 无法连接到会话 '{session_name}'")
 
@@ -213,12 +245,8 @@ class LarkHandler:
 
     async def _cmd_list(self, user_id: str, chat_id: str,
                          message_id: Optional[str] = None):
-        """列出会话"""
-        sessions = list_active_sessions()
-        current = self._chat_sessions.get(chat_id)
-        session_groups = {sname: cid for cid, sname in self._chat_bindings.items() if cid.startswith("oc_")}
-        card = build_session_list_card(sessions, current, session_groups=session_groups)
-        await self._send_or_update_card(chat_id, card, message_id)
+        """列出会话（等价于菜单）"""
+        await self._cmd_menu(user_id, chat_id, message_id=message_id)
 
     async def _cmd_status(self, user_id: str, chat_id: str):
         """显示状态"""
@@ -300,10 +328,6 @@ class LarkHandler:
             if ok:
                 self._chat_bindings[chat_id] = session_name
                 self._save_chat_bindings()
-                work_info = f"\n工作目录: {work_dir}" if work_dir else ""
-                await card_service.send_text(
-                    chat_id, f"✅ 会话 '{session_name}' 已启动并连接{work_info}"
-                )
             else:
                 await card_service.send_text(
                     chat_id,
@@ -393,7 +417,10 @@ class LarkHandler:
     async def _handle_stream_detach(self, user_id: str, chat_id: str,
                                      session_name: str, message_id: Optional[str] = None):
         """流式卡片中断开连接，就地更新卡片为已断开状态"""
-        # 读取最后一次快照的 blocks 用于展示
+        # 停止轮询并获取活跃 CardSlice（原子操作）
+        active_slice = self._poller.stop_and_get_active_slice(chat_id)
+
+        # 读取最后快照的 blocks
         blocks = []
         try:
             import sys as _sys
@@ -409,13 +436,52 @@ class LarkHandler:
             pass
 
         self._remove_binding_by_chat(chat_id)
+        # _detach 中 _poller.stop() 幂等（已调用 stop_and_get_active_slice）
         await self._detach(chat_id)
 
-        card = build_stream_card(blocks, disconnected=True, session_name=session_name)
-        await self._send_or_update_card(chat_id, card, message_id)
+        blocks_slice = blocks[active_slice.start_idx:] if active_slice else blocks
+        card = build_stream_card(blocks_slice, disconnected=True, session_name=session_name)
 
-    async def _handle_stream_reconnect(self, user_id: str, chat_id: str, session_name: str):
-        """流式卡片中重新连接"""
+        updated = False
+        if active_slice:
+            try:
+                success = await card_service.update_card(
+                    card_id=active_slice.card_id,
+                    sequence=active_slice.sequence + 1,
+                    card_content=card,
+                )
+                if success:
+                    active_slice.sequence += 1
+                    self._detached_slices[chat_id] = active_slice
+                    updated = True
+            except Exception as e:
+                logger.warning(f"_handle_stream_detach 就地更新失败: {e}")
+
+        if not updated:
+            await self._send_or_update_card(chat_id, card, message_id)
+
+    async def _handle_stream_reconnect(self, user_id: str, chat_id: str,
+                                       session_name: str, message_id: Optional[str] = None):
+        """流式卡片中重新连接：冻结旧断开卡片 → 重新 attach"""
+        # 冻结旧断开卡片
+        old_slice = self._detached_slices.pop(chat_id, None)
+        if old_slice:
+            try:
+                frozen_card = build_stream_card([], is_frozen=True, session_name=session_name)
+                await card_service.update_card(
+                    card_id=old_slice.card_id,
+                    sequence=old_slice.sequence + 1,
+                    card_content=frozen_card,
+                )
+            except Exception as e:
+                logger.warning(f"_handle_stream_reconnect 冻结旧卡片失败: {e}")
+        elif message_id:
+            try:
+                frozen_card = build_stream_card([], is_frozen=True, session_name=session_name)
+                await card_service.update_card_by_message_id(message_id, frozen_card)
+            except Exception as e:
+                logger.warning(f"_handle_stream_reconnect 按 message_id 冻结失败: {e}")
+
         await self._cmd_attach(user_id, chat_id, session_name)
 
     async def _cmd_help(self, user_id: str, chat_id: str,
@@ -426,10 +492,11 @@ class LarkHandler:
 
     async def _cmd_menu(self, user_id: str, chat_id: str,
                          message_id: Optional[str] = None):
-        """显示快捷操作菜单"""
+        """显示快捷操作菜单（内嵌会话列表）"""
         sessions = list_active_sessions()
         current = self._chat_sessions.get(chat_id)
-        card = build_menu_card(sessions, current_session=current)
+        session_groups = {sname: cid for cid, sname in self._chat_bindings.items() if cid.startswith("oc_")}
+        card = build_menu_card(sessions, current_session=current, session_groups=session_groups)
         await self._send_or_update_card(chat_id, card, message_id)
 
     async def _cmd_ls(self, user_id: str, chat_id: str, args: str,

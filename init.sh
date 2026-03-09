@@ -36,6 +36,24 @@ print_header() {
     echo ""
 }
 
+# 确保 ~/.local/bin 在 PATH 中
+setup_path() {
+    local PROFILE="$HOME/.bash_profile"
+    # 不存在则创建
+    [[ -f "$PROFILE" ]] || touch "$PROFILE"
+
+    # 未写入则追加
+    if ! grep -qF '$HOME/.local/bin' "$PROFILE" 2>/dev/null; then
+        echo "" >> "$PROFILE"
+        echo '# remote-claude: 确保 ~/.local/bin 在 PATH' >> "$PROFILE"
+        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$PROFILE"
+    fi
+
+    # 使当前脚本会话立即生效
+    source "$PROFILE" 2>/dev/null || true
+    export PATH="$HOME/.local/bin:$PATH"
+}
+
 # 检查操作系统
 check_os() {
     print_header "检查系统环境"
@@ -61,14 +79,80 @@ check_uv() {
     fi
 
     print_warning "未找到 uv，正在安装..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    # 重新加载 PATH
-    export PATH="$HOME/.local/bin:$PATH"
+
+    # 检测可用的 pip 命令
+    local PIP_CMD=""
+    if command -v pip3 &> /dev/null; then
+        PIP_CMD="pip3"
+    elif command -v pip &> /dev/null; then
+        PIP_CMD="pip"
+    fi
+
+    # 方式一：官方安装脚本（需访问 astral.sh/GitHub）
+    if curl -LsSf --connect-timeout 10 https://astral.sh/uv/install.sh | sh 2>/dev/null; then
+        export PATH="$HOME/.local/bin:$PATH"
+    fi
+
+    # 方式二：pip + PyPI（GitHub 访问受限时首选；国内镜像比 GitHub 稳定）
+    if ! command -v uv &> /dev/null && [[ -n "$PIP_CMD" ]]; then
+        print_warning "尝试 pip 安装 uv（官方 PyPI）..."
+        ($PIP_CMD install uv --quiet 2>/dev/null || \
+         $PIP_CMD install uv --quiet --break-system-packages 2>/dev/null) && \
+            export PATH="$HOME/.local/bin:$PATH"
+    fi
+
+    # 方式三：pip + 国内镜像（清华 PyPI，适合无法访问 GitHub/pypi.org 的内网环境）
+    if ! command -v uv &> /dev/null && [[ -n "$PIP_CMD" ]]; then
+        print_warning "尝试 pip 安装 uv（清华镜像）..."
+        ($PIP_CMD install uv --quiet \
+            -i https://pypi.tuna.tsinghua.edu.cn/simple/ \
+            --trusted-host pypi.tuna.tsinghua.edu.cn 2>/dev/null || \
+         $PIP_CMD install uv --quiet \
+            -i https://pypi.tuna.tsinghua.edu.cn/simple/ \
+            --trusted-host pypi.tuna.tsinghua.edu.cn \
+            --break-system-packages 2>/dev/null) && \
+            export PATH="$HOME/.local/bin:$PATH"
+    fi
+
+    # 方式四：conda/mamba（适合已有 Anaconda/Miniconda 环境的机器）
+    if ! command -v uv &> /dev/null; then
+        if command -v mamba &> /dev/null; then
+            print_warning "尝试 mamba 安装 uv..."
+            mamba install -c conda-forge uv -y --quiet 2>/dev/null || true
+        elif command -v conda &> /dev/null; then
+            print_warning "尝试 conda 安装 uv..."
+            conda install -c conda-forge uv -y --quiet 2>/dev/null || true
+        fi
+    fi
+
+    # 方式五：brew（macOS 备用）
+    if ! command -v uv &> /dev/null && [[ "$OS" == "Darwin" ]] && command -v brew &> /dev/null; then
+        print_warning "尝试 brew install uv..."
+        brew install uv
+    fi
 
     if command -v uv &> /dev/null; then
         print_success "uv 安装成功"
+
+        # 确保 ~/.local/bin 写入 shell rc（uv 官方脚本可能写 .zprofile 而非 .zshrc）
+        local _RC
+        if [[ -n "$ZSH_VERSION" ]] || [[ "$(basename "$SHELL")" == "zsh" ]]; then
+            _RC="$HOME/.zshrc"
+        else
+            _RC="$HOME/.bashrc"
+        fi
+        if ! grep -qF "$HOME/.local/bin" "$_RC" 2>/dev/null; then
+            echo "" >> "$_RC"
+            echo "# uv" >> "$_RC"
+            echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$_RC"
+            print_success "已将 \$HOME/.local/bin 写入 $_RC"
+        fi
     else
-        print_error "uv 安装失败，请手动安装: https://docs.astral.sh/uv/"
+        print_error "uv 安装失败，请手动安装，可选方式："
+        print_info "  pip3 install uv"
+        print_info "  pip3 install uv -i https://pypi.tuna.tsinghua.edu.cn/simple/"
+        print_info "  conda install -c conda-forge uv"
+        print_info "  详见: https://docs.astral.sh/uv/getting-started/installation/"
         exit 1
     fi
 }
@@ -83,8 +167,19 @@ check_tmux() {
     install_tmux() {
         if [[ "$OS" == "Darwin" ]]; then
             if ! command -v brew &> /dev/null; then
-                print_error "未找到 Homebrew，请先安装: https://brew.sh"
-                exit 1
+                print_warning "未找到 Homebrew，正在自动安装..."
+                /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+                # 将 Homebrew 加入 PATH（Apple Silicon / Intel 路径不同）
+                if [[ -x "/opt/homebrew/bin/brew" ]]; then
+                    eval "$(/opt/homebrew/bin/brew shellenv)"
+                elif [[ -x "/usr/local/bin/brew" ]]; then
+                    eval "$(/usr/local/bin/brew shellenv)"
+                fi
+                if ! command -v brew &> /dev/null; then
+                    print_error "Homebrew 安装失败，请手动安装后重试: https://brew.sh"
+                    exit 1
+                fi
+                print_success "Homebrew 安装成功"
             fi
             brew install tmux
         elif [[ "$OS" == "Linux" ]]; then
@@ -92,12 +187,91 @@ check_tmux() {
                 sudo apt-get update && sudo apt-get install -y tmux
             elif command -v yum &> /dev/null; then
                 sudo yum install -y tmux
+            elif command -v pacman &> /dev/null; then
+                sudo pacman -Sy --noconfirm tmux
+            elif command -v apk &> /dev/null; then
+                sudo apk add --no-cache tmux
+            elif command -v zypper &> /dev/null; then
+                sudo zypper install -y tmux
             else
-                print_error "无法自动安装 tmux，请手动安装 3.6 或更高版本"
-                exit 1
+                print_warning "无法识别包管理器，尝试从源码编译 tmux..."
+                install_tmux_from_source
+                return
             fi
         fi
         print_success "tmux 安装成功"
+    }
+
+    install_tmux_from_source() {
+        local TMUX_VERSION_TAG="3.6a"
+        local TMUX_URL="https://github.com/tmux/tmux/releases/download/${TMUX_VERSION_TAG}/tmux-${TMUX_VERSION_TAG}.tar.gz"
+
+        print_warning "包管理器版本不满足要求，尝试从源码编译 tmux ${TMUX_VERSION_TAG}..."
+
+        # 安装编译依赖
+        if [[ "$OS" == "Darwin" ]]; then
+            brew install libevent ncurses pkg-config bison 2>/dev/null || true
+        elif command -v apt-get &> /dev/null; then
+            sudo apt-get install -y build-essential libevent-dev libncurses5-dev libncursesw5-dev bison pkg-config
+        elif command -v yum &> /dev/null; then
+            sudo yum groupinstall -y "Development Tools"
+            sudo yum install -y libevent-devel ncurses-devel bison
+        fi
+
+        # 确定安装前缀
+        local PREFIX="/usr/local"
+        if ! sudo -n true 2>/dev/null; then
+            print_warning "无 sudo 权限，将安装到 \$HOME/.local"
+            PREFIX="$HOME/.local"
+        fi
+
+        # 创建临时目录，编译完成后清理
+        local TMPDIR
+        TMPDIR=$(mktemp -d)
+        trap "rm -rf '$TMPDIR'" RETURN
+
+        print_warning "下载 tmux-${TMUX_VERSION_TAG}.tar.gz..."
+        if ! curl -fsSL "$TMUX_URL" -o "$TMPDIR/tmux.tar.gz"; then
+            print_warning "下载失败，请检查网络或手动安装 tmux ${REQUIRED_MAJOR}.${REQUIRED_MINOR}+"
+            WARNINGS+=("tmux 源码下载失败，请手动安装 tmux ${REQUIRED_MAJOR}.${REQUIRED_MINOR}+")
+            return
+        fi
+
+        tar -xzf "$TMPDIR/tmux.tar.gz" -C "$TMPDIR"
+        local SRC_DIR
+        SRC_DIR=$(find "$TMPDIR" -maxdepth 1 -type d -name "tmux-*" | head -1)
+
+        print_warning "编译 tmux（可能需要几分钟）..."
+        if ! (cd "$SRC_DIR" && ./configure --prefix="$PREFIX" && make -j"$(nproc 2>/dev/null || echo 2)"); then
+            print_warning "编译失败，请手动安装 tmux ${REQUIRED_MAJOR}.${REQUIRED_MINOR}+"
+            WARNINGS+=("tmux 源码编译失败，请手动安装 tmux ${REQUIRED_MAJOR}.${REQUIRED_MINOR}+")
+            return
+        fi
+
+        if [[ "$PREFIX" == "/usr/local" ]]; then
+            sudo make -C "$SRC_DIR" install
+        else
+            make -C "$SRC_DIR" install
+            # 若 $HOME/.local/bin 不在 PATH 中，自动写入 shell 配置
+            if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+                export PATH="$HOME/.local/bin:$PATH"
+                local _RC
+                if [[ "$(basename "$SHELL")" == "zsh" ]]; then
+                    _RC="$HOME/.zshrc"
+                else
+                    _RC="$HOME/.bashrc"
+                fi
+                local _PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
+                if ! grep -qF "$HOME/.local/bin" "$_RC" 2>/dev/null; then
+                    echo "" >> "$_RC"
+                    echo "# remote-claude: tmux 路径" >> "$_RC"
+                    echo "$_PATH_LINE" >> "$_RC"
+                    print_success "已自动将 \$HOME/.local/bin 加入 PATH（写入 $_RC）"
+                fi
+            fi
+        fi
+
+        print_success "tmux ${TMUX_VERSION_TAG} 源码编译安装完成（前缀：${PREFIX}）"
     }
 
     check_version() {
@@ -122,10 +296,15 @@ check_tmux() {
         else
             print_warning "$TMUX_VERSION 版本过低，需要 ${REQUIRED_MAJOR}.${REQUIRED_MINOR} 或更高，正在升级..."
             install_tmux
-            # 升级后再次验证
+            # 升级后再次验证，版本仍不满足则走源码编译（跨平台）
             if ! check_version; then
-                print_warning "升级后版本仍不满足要求（$(tmux -V)），请手动安装 tmux ${REQUIRED_MAJOR}.${REQUIRED_MINOR}+"
-                WARNINGS+=("tmux 版本不满足要求（$(tmux -V)），需要 ${REQUIRED_MAJOR}.${REQUIRED_MINOR}+，请手动升级")
+                install_tmux_from_source
+                if check_version; then
+                    print_success "tmux 已升级至 $(tmux -V)"
+                else
+                    print_warning "源码编译后版本仍不满足要求（$(tmux -V)），需要 ${REQUIRED_MAJOR}.${REQUIRED_MINOR}+"
+                    WARNINGS+=("tmux 版本不满足要求（$(tmux -V)），需要 ${REQUIRED_MAJOR}.${REQUIRED_MINOR}+，请手动升级")
+                fi
             else
                 print_success "tmux 已升级至 $(tmux -V)"
             fi
@@ -134,8 +313,11 @@ check_tmux() {
         print_warning "未找到 tmux，正在安装..."
         install_tmux
         if ! check_version; then
-            print_warning "安装的版本不满足要求（$(tmux -V)），请手动安装 tmux ${REQUIRED_MAJOR}.${REQUIRED_MINOR}+"
-            WARNINGS+=("tmux 版本不满足要求（$(tmux -V)），需要 ${REQUIRED_MAJOR}.${REQUIRED_MINOR}+，请手动升级")
+            install_tmux_from_source
+            if ! check_version; then
+                print_warning "源码编译后版本仍不满足要求（$(tmux -V)），需要 ${REQUIRED_MAJOR}.${REQUIRED_MINOR}+"
+                WARNINGS+=("tmux 版本不满足要求（$(tmux -V)），需要 ${REQUIRED_MAJOR}.${REQUIRED_MINOR}+，请手动升级")
+            fi
         fi
     fi
 }
@@ -151,6 +333,11 @@ check_claude() {
 
     print_warning "未找到 Claude CLI"
     print_info "请访问 https://claude.ai/code 安装 Claude CLI"
+
+    if $NPM_MODE; then
+        print_info "（npm 模式：跳过交互，请安装后重新运行）"
+        return
+    fi
 
     read -p "$(echo -e ${YELLOW}是否已安装 Claude CLI？${NC} [y/N]: )" -n 1 -r
     echo
@@ -175,7 +362,11 @@ install_dependencies() {
     fi
 
     print_info "正在通过 uv 同步依赖..."
-    uv sync
+    if $NPM_MODE; then
+        uv sync --frozen
+    else
+        uv sync
+    fi
 
     print_success "依赖安装完成"
 }
@@ -184,8 +375,17 @@ install_dependencies() {
 configure_lark() {
     print_header "配置飞书客户端"
 
-    if [ -f ".env" ]; then
-        print_warning ".env 文件已存在，跳过配置"
+    ENV_FILE="$HOME/.remote-claude/.env"
+    mkdir -p "$HOME/.remote-claude"
+
+    # 迁移旧 .env（项目根目录）到新位置
+    if [ -f ".env" ] && [ ! -f "$ENV_FILE" ]; then
+        mv ".env" "$ENV_FILE"
+        print_success "已将 .env 迁移到 $ENV_FILE"
+    fi
+
+    if [ -f "$ENV_FILE" ]; then
+        print_warning ".env 文件已存在（$ENV_FILE），跳过配置"
         return
     fi
 
@@ -198,9 +398,9 @@ configure_lark() {
     echo
 
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        cp .env.example .env
-        print_success ".env 文件已创建"
-        print_warning "请编辑 .env 文件，填写以下信息："
+        cp .env.example "$ENV_FILE"
+        print_success ".env 文件已创建于 $ENV_FILE"
+        print_warning "请编辑 $ENV_FILE，填写以下信息："
         print_info "  - FEISHU_APP_ID: 飞书应用的 App ID"
         print_info "  - FEISHU_APP_SECRET: 飞书应用的 App Secret"
         print_info ""
@@ -215,12 +415,20 @@ create_directories() {
     print_header "创建运行目录"
 
     SOCKET_DIR="/tmp/remote-claude"
+    USER_DATA_DIR="$HOME/.remote-claude"
 
     if [ ! -d "$SOCKET_DIR" ]; then
         mkdir -p "$SOCKET_DIR"
         print_success "创建目录: $SOCKET_DIR"
     else
         print_info "目录已存在: $SOCKET_DIR"
+    fi
+
+    if [ ! -d "$USER_DATA_DIR" ]; then
+        mkdir -p "$USER_DATA_DIR"
+        print_success "创建目录: $USER_DATA_DIR"
+    else
+        print_info "目录已存在: $USER_DATA_DIR"
     fi
 }
 
@@ -240,7 +448,7 @@ configure_shell() {
     print_header "安装快捷命令"
 
     SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-    chmod +x "$SCRIPT_DIR/bin/cla" "$SCRIPT_DIR/bin/cl"
+    chmod +x "$SCRIPT_DIR/bin/cla" "$SCRIPT_DIR/bin/cl" "$SCRIPT_DIR/bin/remote-claude"
 
     # 优先 /usr/local/bin，权限不够则选 ~/bin 或 ~/.local/bin 中已在 PATH 里的
     BIN_DIR="/usr/local/bin"
@@ -251,20 +459,53 @@ configure_shell() {
             BIN_DIR="$HOME/.local/bin"
         else
             BIN_DIR="$HOME/.local/bin"
-            print_warning "cla/cl 将安装到 $BIN_DIR，但该目录不在 PATH 中"
-            print_info "请将以下行添加到 shell 配置文件（~/.zshrc 或 ~/.bashrc）："
-            echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+            # 自动写入 PATH 到 shell 配置文件
+            export PATH="$BIN_DIR:$PATH"
+            local _RC
+            if [[ -n "$ZSH_VERSION" ]] || [[ "$(basename "$SHELL")" == "zsh" ]]; then
+                _RC="$HOME/.zshrc"
+            else
+                _RC="$HOME/.bashrc"
+            fi
+            local _PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
+            if ! grep -qF "$HOME/.local/bin" "$_RC" 2>/dev/null; then
+                echo "" >> "$_RC"
+                echo "# remote-claude: 快捷命令路径" >> "$_RC"
+                echo "$_PATH_LINE" >> "$_RC"
+                print_success "已自动将 \$HOME/.local/bin 加入 PATH（写入 $_RC）"
+            fi
         fi
         mkdir -p "$BIN_DIR"
-        ln -sf "$SCRIPT_DIR/bin/cla" "$BIN_DIR/cla"
-        ln -sf "$SCRIPT_DIR/bin/cl"  "$BIN_DIR/cl"
+        ln -sf "$SCRIPT_DIR/bin/cla"          "$BIN_DIR/cla"
+        ln -sf "$SCRIPT_DIR/bin/cl"           "$BIN_DIR/cl"
+        ln -sf "$SCRIPT_DIR/bin/remote-claude" "$BIN_DIR/remote-claude"
     else
-        ln -sf "$SCRIPT_DIR/bin/cl" "$BIN_DIR/cl"
+        ln -sf "$SCRIPT_DIR/bin/cl"           "$BIN_DIR/cl"
+        ln -sf "$SCRIPT_DIR/bin/remote-claude" "$BIN_DIR/remote-claude"
     fi
 
-    print_success "已安装 cla 和 cl 到 $BIN_DIR"
-    print_info "  cla  - 启动飞书客户端 + 以当前目录路径+时间戳为会话名启动 Claude"
-    print_info "  cl   - 同 cla，但跳过权限确认"
+    print_success "已安装 cla、cl 和 remote-claude 到 $BIN_DIR"
+    print_info "  cla           - 启动飞书客户端 + 以当前目录路径+时间戳为会话名启动 Claude"
+    print_info "  cl            - 同 cla，但跳过权限确认"
+    print_info "  remote-claude - Remote Claude 主命令（start/attach/list/kill/lark）"
+
+    # 安装 shell 自动补全
+    local COMPLETION_LINE="source \"$SCRIPT_DIR/scripts/completion.sh\""
+    local SHELL_RC=""
+    if [[ -n "$ZSH_VERSION" ]] || [[ "$(basename "$SHELL")" == "zsh" ]]; then
+        SHELL_RC="$HOME/.zshrc"
+    else
+        SHELL_RC="$HOME/.bashrc"
+    fi
+
+    if [[ -f "$SHELL_RC" ]] && grep -qF "$SCRIPT_DIR/scripts/completion.sh" "$SHELL_RC" 2>/dev/null; then
+        print_info "自动补全已配置（$SHELL_RC）"
+    else
+        echo "" >> "$SHELL_RC"
+        echo "# remote-claude 自动补全" >> "$SHELL_RC"
+        echo "$COMPLETION_LINE" >> "$SHELL_RC"
+        print_success "已添加自动补全到 $SHELL_RC（重新打开终端后生效）"
+    fi
 }
 
 # 重启飞书客户端
@@ -297,11 +538,20 @@ ${YELLOW}快捷命令：${NC}
 
 详细使用说明请阅读 README.md
 
+${YELLOW}提示：${NC}请运行以下命令使 PATH 生效，或重新打开终端：
+  source ~/.bash_profile
+
 EOF
 }
 
 # 主流程
 main() {
+    # 解析参数
+    NPM_MODE=false
+    for arg in "$@"; do
+        [[ "$arg" == "--npm" ]] && NPM_MODE=true
+    done
+
     echo ""
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${GREEN}   Remote Claude 初始化脚本${NC}"
@@ -309,12 +559,15 @@ main() {
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
 
+    setup_path
     check_os
     check_uv
     check_tmux
     check_claude
     install_dependencies
-    configure_lark
+    if ! $NPM_MODE; then
+        configure_lark
+    fi
     create_directories
     set_permissions
     configure_shell
@@ -333,4 +586,4 @@ main() {
 }
 
 # 运行主流程
-main
+main "$@"

@@ -8,5 +8,13 @@ while [ -L "$SOURCE" ]; do
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && cd .. && pwd)"
 
+# uv 路径兜底
+if ! command -v uv &>/dev/null; then
+    [ -f "$HOME/.local/bin/uv" ] && export PATH="$HOME/.local/bin:$PATH"
+fi
+
+# 检查飞书配置
+source "$SCRIPT_DIR/scripts/check-env.sh" "$SCRIPT_DIR"
+
 uv run --project "$SCRIPT_DIR" python3 "$SCRIPT_DIR/remote_claude.py" lark start
-uv run --project "$SCRIPT_DIR" python3 "$SCRIPT_DIR/remote_claude.py" start "${PWD}_$(date +%m%d_%H%M%S)" -- --dangerously-skip-permissions --permission-mode=dontAsk
+uv run --project "$SCRIPT_DIR" python3 "$SCRIPT_DIR/remote_claude.py" start "${PWD}_$(date +%m%d_%H%M%S)" -- --dangerously-skip-permissions --permission-mode=dontAsk "$@"

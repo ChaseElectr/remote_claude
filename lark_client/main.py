@@ -114,9 +114,8 @@ def handle_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerRespons
             command_text = (form_value.get("command") or "").strip()
             print(f"[Lark] form 提交: user={user_id[:8]}..., command={command_text!r}")
             if command_text:
-                # 有输入内容 → 当作消息处理（支持 /命令 和普通文本）
-                chat_type = getattr(context, 'chat_type', 'p2p') or 'p2p'
-                asyncio.create_task(handler.handle_message(user_id, chat_id, command_text, chat_type=chat_type))
+                # 有输入内容 → 直通 Claude
+                asyncio.create_task(handler.forward_to_claude(user_id, chat_id, command_text))
             else:
                 # 空输入 → 发送原始 Enter 键（用于确认默认选项等场景）
                 asyncio.create_task(handler.send_raw_key(user_id, chat_id, "enter"))
@@ -136,7 +135,7 @@ def handle_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerRespons
         if action_type == "list_attach":
             session_name = action_value.get("session", "")
             print(f"[Lark] list_attach: session={session_name}")
-            asyncio.create_task(handler._cmd_attach(user_id, chat_id, session_name))
+            asyncio.create_task(handler._cmd_attach(user_id, chat_id, session_name, message_id=message_id))
             return None
 
         # 列表卡片：断开连接
@@ -214,18 +213,19 @@ def handle_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerRespons
         if action_type == "stream_reconnect":
             session_name = action_value.get("session", "")
             print(f"[Lark] stream_reconnect: session={session_name}")
-            asyncio.create_task(handler._handle_stream_reconnect(user_id, chat_id, session_name))
+            asyncio.create_task(handler._handle_stream_reconnect(user_id, chat_id, session_name, message_id=message_id))
             return None
 
-        # 快捷键按钮：发送原始控制键到 Claude CLI（无 toast，依靠快速轮询反馈）
+        # 快捷键按钮（callback 模式）
         if action_type == "send_key":
             key_name = action_value.get("key", "")
+            print(f"[Lark] send_key: key={key_name}")
             asyncio.create_task(handler.send_raw_key(user_id, chat_id, key_name))
             return None
 
-        # 各卡片底部菜单按钮：发送新菜单卡片
+        # 各卡片底部菜单按钮：辅助卡片就地→菜单，流式卡片降级新卡
         if action_type == "menu_open":
-            asyncio.create_task(handler._cmd_menu(user_id, chat_id))
+            asyncio.create_task(handler._cmd_menu(user_id, chat_id, message_id=message_id))
             return None
 
         # 默认响应
@@ -250,7 +250,7 @@ class LarkBot:
         # 检查配置
         if not config.FEISHU_APP_ID or not config.FEISHU_APP_SECRET:
             print("错误: 请配置 FEISHU_APP_ID 和 FEISHU_APP_SECRET")
-            print("在 .env 文件中添加:")
+            print("在 ~/.remote-claude/.env 文件中添加:")
             print("  FEISHU_APP_ID=your_app_id")
             print("  FEISHU_APP_SECRET=your_app_secret")
             return

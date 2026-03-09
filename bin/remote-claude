@@ -6,15 +6,16 @@ while [ -L "$SOURCE" ]; do
     SOURCE="$(readlink "$SOURCE")"
     [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
 done
-SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && cd .. && pwd)"
+INSTALL_DIR="$(cd -P "$(dirname "$SOURCE")" && cd .. && pwd)"
 
 # uv 路径兜底
 if ! command -v uv &>/dev/null; then
     [ -f "$HOME/.local/bin/uv" ] && export PATH="$HOME/.local/bin:$PATH"
 fi
 
-# 检查飞书配置
-source "$SCRIPT_DIR/scripts/check-env.sh" "$SCRIPT_DIR"
+# lark 子命令：检查 .env 配置
+if [ "$1" = "lark" ]; then
+    source "$INSTALL_DIR/scripts/check-env.sh" "$INSTALL_DIR"
+fi
 
-uv run --project "$SCRIPT_DIR" python3 "$SCRIPT_DIR/remote_claude.py" lark start
-uv run --project "$SCRIPT_DIR" python3 "$SCRIPT_DIR/remote_claude.py" start "${PWD}_$(date +%m%d_%H%M%S)" -- "$@"
+exec uv run --project "$INSTALL_DIR" python3 "$INSTALL_DIR/remote_claude.py" "$@"

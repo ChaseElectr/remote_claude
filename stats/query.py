@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-_DB_PATH = Path.home() / ".local" / "share" / "remote-claude" / "stats.db"
+_DB_PATH = Path.home() / ".remote-claude" / "stats.db"
 
 
 def _get_conn() -> Optional[sqlite3.Connection]:

@@ -16,7 +16,7 @@ from typing import List, Optional, Dict, Tuple, Set
 import pyte
 
 from utils.components import (
-    Component, OutputBlock, UserInput, OptionBlock, StatusLine, BottomBar, AgentPanelBlock,
+    Component, OutputBlock, UserInput, OptionBlock, StatusLine, BottomBar, AgentPanelBlock, PlanBlock,
 )
 
 logger = logging.getLogger('ComponentParser')
@@ -34,6 +34,11 @@ DOT_CHARS: Set[str] = {'●', '⏺', '⚫', '•', '◉', '◦', '⏹'}
 
 # 分割线字符集
 DIVIDER_CHARS: Set[str] = set('─━═')
+
+# Box-drawing 字符集（Plan Mode 使用的框线字符）
+BOX_CORNER_TOP: Set[str] = {'╭', '┌'}
+BOX_CORNER_BOTTOM: Set[str] = {'╰', '└'}
+BOX_VERTICAL: Set[str] = {'│', '┃', '║'}
 
 # 编号选项行正则（权限确认对话框特征：❯ 1. Yes / 2. No 等）
 _NUMBERED_OPTION_RE = re.compile(r'^(?:❯\s*)?\d+[.)]\s+.+')
@@ -449,10 +454,27 @@ class ScreenParser:
         return output_rows, input_rows, bottom_rows
 
     def _trim_welcome(self, screen: pyte.Screen, rows: List[int]) -> List[int]:
-        """去掉欢迎区域：跳过首列为空的前缀行，从第一个首列有内容的行开始"""
-        for i, row in enumerate(rows):
-            if _get_col0(screen, row).strip():
-                return rows[i:]
+        """去掉欢迎区域：跳过首列为空的前缀行和欢迎框（Claude Code box）"""
+        i = 0
+        while i < len(rows):
+            col0 = _get_col0(screen, rows[i])
+            if not col0.strip():
+                i += 1
+                continue
+            # 首个非空 col0 是 box 顶角 → 检查是否为欢迎框
+            if col0 in BOX_CORNER_TOP:
+                first_line = _get_row_text(screen, rows[i])
+                if 'Claude Code' in first_line:
+                    # 跳过整个欢迎框（到 ╰/└ 行为止）
+                    i += 1
+                    while i < len(rows):
+                        if _get_col0(screen, rows[i]) in BOX_CORNER_BOTTOM:
+                            i += 1
+                            break
+                        i += 1
+                    continue  # 继续跳过后续空行
+            # 非欢迎框，返回剩余行
+            return rows[i:]
         return []
 
     # ─── Step 2+3+4：输出区解析 ────────────────────────────────────────────
@@ -477,12 +499,34 @@ class ScreenParser:
             return []
 
         # 切 Block：首列有非空字符 OR 在 dot_row_cache 中（圆点闪烁隐去帧）→ Block 首行
+        # box 区域（╭...╰）整体合并为一个 block
         blocks: List[Tuple[int, List[int]]] = []
         current_first: Optional[int] = None
         current_rows: Optional[List[int]] = None
+        in_box = False
 
         for row in rows:
             col0 = _get_col0(screen, row)
+
+            # Box 区域合并：╭ 开始 → │ 继续 → ╰ 结束，整个区域作为一个 block
+            if in_box:
+                current_rows.append(row)
+                if col0 in BOX_CORNER_BOTTOM:
+                    blocks.append((current_first, current_rows))
+                    current_first = None
+                    current_rows = None
+                    in_box = False
+                continue
+
+            if col0 in BOX_CORNER_TOP:
+                # 先保存当前正在构建的 block
+                if current_rows is not None:
+                    blocks.append((current_first, current_rows))
+                current_first = row
+                current_rows = [row]
+                in_box = True
+                continue
+
             is_header = bool(col0.strip()) or (row in self._dot_row_cache)
 
             if is_header:
@@ -533,6 +577,10 @@ class ScreenParser:
         if not col0.strip():
             return None
 
+        # PlanBlock：box-drawing 顶角字符（╭ 或 ┌）
+        if col0 in BOX_CORNER_TOP:
+            return self._parse_plan_block(screen, first_row, block_rows)
+
         lines = [_get_row_text(screen, r) for r in block_rows]
 
         # StatusLine：星星字符
@@ -578,6 +626,46 @@ class ScreenParser:
 
         # 其他首列字符（装饰残留、欢迎区片段等），忽略
         return None
+
+    def _parse_plan_block(
+        self, screen: pyte.Screen, first_row: int, block_rows: List[int]
+    ) -> PlanBlock:
+        """解析 box-drawing 框线包裹的计划内容（Plan Mode）"""
+        content_lines = []
+        ansi_lines = []
+        for row in block_rows:
+            col0 = _get_col0(screen, row)
+            if col0 in BOX_CORNER_TOP or col0 in BOX_CORNER_BOTTOM:
+                continue  # 跳过顶/底边框行
+            if col0 in BOX_VERTICAL:
+                line = _get_row_text(screen, row)
+                inner = line[1:]  # 去掉左侧 │
+                # 去掉右侧 │（如有）
+                stripped = inner.rstrip()
+                if stripped and stripped[-1] in BOX_VERTICAL:
+                    inner = stripped[:-1]
+                content_lines.append(inner.rstrip())
+                ansi_line = _get_row_ansi_text(screen, row, start_col=1)
+                # 去掉右侧 │（可能包裹 ANSI 码，如 │\x1b[0m 或 \x1b[...m│\x1b[0m）
+                ansi_line = re.sub(r'(\x1b\[[0-9;]*m)*[│┃║](\x1b\[0m)?\s*$', '', ansi_line)
+                ansi_lines.append(ansi_line.rstrip())
+
+        content = '\n'.join(content_lines).strip()
+        ansi_content = '\n'.join(ansi_lines).strip()
+
+        title = ''
+        for line in content_lines:
+            if line.strip():
+                title = line.strip()
+                break
+
+        return PlanBlock(
+            title=title,
+            content=content,
+            is_streaming=False,
+            start_row=first_row,
+            ansi_content=ansi_content,
+        )
 
     def _parse_status_block(
         self, first_line: str,
@@ -1035,6 +1123,8 @@ def components_content_key(components: List[Component]) -> str:
                 parts.append(f"AP:summary:{c.agent_count}")
             else:
                 parts.append(f"AP:list:{c.agent_count}")
+        elif isinstance(c, PlanBlock):
+            parts.append(f"PL:{c.title[:50]}")
         elif isinstance(c, StatusLine):
             parts.append(f"S:{c.action}:{c.elapsed}")
         elif isinstance(c, BottomBar):

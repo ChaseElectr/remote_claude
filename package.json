@@ -1,0 +1,42 @@
+{
+  "name": "remote-claude",
+  "version": "0.1.4",
+  "description": "双端共享 Claude CLI 工具",
+  "bin": {
+    "remote-claude": "bin/remote-claude",
+    "cla": "bin/cla",
+    "cl": "bin/cl"
+  },
+  "scripts": {
+    "postinstall": "bash scripts/postinstall.sh"
+  },
+  "files": [
+    "bin/",
+    "scripts/",
+    "init.sh",
+    "remote_claude.py",
+    "server/*.py",
+    "client/*.py",
+    "utils/*.py",
+    "lark_client/__init__.py",
+    "lark_client/*.py",
+    "stats/__init__.py",
+    "stats/*.py",
+    "pyproject.toml",
+    "uv.lock",
+    ".env.example"
+  ],
+  "os": ["darwin", "linux"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yuyangzi/remote_claude.git"
+  },
+  "keywords": ["claude", "cli", "terminal", "pty", "lark"],
+  "engines": {
+    "node": ">=16"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  }
+}

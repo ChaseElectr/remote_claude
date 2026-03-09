@@ -29,7 +29,8 @@ from utils.session import (
     tmux_kill_session,
     list_active_sessions, is_session_active, cleanup_session,
     is_lark_running, get_lark_pid, get_lark_status, get_lark_pid_file,
-    save_lark_status, cleanup_lark
+    save_lark_status, cleanup_lark,
+    USER_DATA_DIR, ensure_user_data_dir, get_lark_log_file
 )
 
 
@@ -196,9 +197,10 @@ def cmd_lark_start(args):
     print("正在启动飞书客户端...")
 
     ensure_socket_dir()
+    ensure_user_data_dir()
 
     # 启动守护进程（使用 -m 模块方式运行，确保相对导入正常工作）
-    log_file = SCRIPT_DIR / "lark_client.log"
+    log_file = get_lark_log_file()
 
     try:
         # 启动进程
@@ -319,7 +321,7 @@ def cmd_lark_status(args):
     print(f"运行时长: {status['uptime']}")
 
     # 检查日志文件
-    log_file = SCRIPT_DIR / "lark_client.log"
+    log_file = get_lark_log_file()
     if log_file.exists():
         print(f"日志文件: {log_file}")
         print(f"日志大小: {log_file.stat().st_size / 1024:.1f} KB")
