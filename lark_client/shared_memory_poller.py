@@ -67,6 +67,8 @@ class StreamTracker:
     reader: Optional[Any] = None  # SharedStateReader，延迟初始化
     is_group: bool = False         # 是否为群聊
     prev_is_ready: bool = True     # 上一帧是否就绪（初始 True 避免首次误触发）
+    ready_since: float = 0.0       # 进入就绪状态的时间戳（用于防抖）
+    notified_this_ready: bool = True  # 当前就绪周期是否已通知（初始 True 避免首次误触发）
     notify_user_id: Optional[str] = None  # 就绪通知 @ 的用户 open_id
     last_notify_message_id: Optional[str] = None  # 上一条就绪通知的 message_id（用于后续加急复用）
 
@@ -502,15 +504,38 @@ class SharedMemoryPoller:
             )
             tracker.last_notify_message_id = None
 
+    READY_DEBOUNCE = 3.0  # 就绪状态必须持续 3 秒才发通知（防止工具调用间隙抖动）
+
     def _update_ready_state(
         self, tracker: StreamTracker,
         blocks: list, status_line: Optional[dict], option_block: Optional[dict],
     ) -> bool:
-        """更新就绪状态，返回是否需要发送就绪通知（不执行发送）"""
+        """更新就绪状态，返回是否需要发送就绪通知（不执行发送）。
+        防抖：就绪状态必须持续 READY_DEBOUNCE 秒才触发，每个就绪周期只通知一次。"""
         current_ready = _is_ready(blocks, status_line, option_block)
-        prev_ready = tracker.prev_is_ready
+
+        if current_ready and not tracker.prev_is_ready:
+            # 刚进入就绪状态，记录时间戳
+            tracker.ready_since = time.time()
+            tracker.notified_this_ready = False
+        elif not current_ready:
+            # 回到非就绪状态，重置
+            tracker.ready_since = 0.0
+
         tracker.prev_is_ready = current_ready
-        return current_ready and not prev_ready and tracker.is_group and _notify_enabled
+
+        # 条件：就绪 + 未通知过 + 群聊 + 通知开启
+        if not current_ready or tracker.notified_this_ready:
+            return False
+        if not tracker.is_group or not _notify_enabled:
+            return False
+
+        # 防抖：持续就绪超过阈值才通知
+        if tracker.ready_since > 0 and (time.time() - tracker.ready_since) >= self.READY_DEBOUNCE:
+            tracker.notified_this_ready = True
+            return True
+
+        return False
 
     async def _send_ready_notification(
         self, tracker: StreamTracker, cli_type: str = "claude"

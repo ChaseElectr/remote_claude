@@ -397,8 +397,37 @@ class LarkBot:
         print("\n机器人已启动，等待消息...")
         print("在飞书中发送 /help 查看使用说明\n")
 
-        # 启动 WebSocket（阻塞）
-        self.ws_client.start()
+        # 启动 WebSocket（阻塞），SDK 退出后自动重连
+        MAX_RESTART_INTERVAL = 30  # 最大重连间隔（秒）
+        restart_count = 0
+        while self.running:
+            try:
+                self.ws_client.start()
+            except Exception as e:
+                logging.getLogger('Lark').error(f"WebSocket 异常退出: {e}")
+
+            if not self.running:
+                break  # 收到 SIGTERM，正常退出
+
+            restart_count += 1
+            delay = min(restart_count * 2, MAX_RESTART_INTERVAL)
+            logging.getLogger('Lark').warning(
+                f"SDK 退出，{delay}s 后第 {restart_count} 次重连..."
+            )
+            import time
+            time.sleep(delay)
+
+            # 重建 WebSocket 客户端（SDK 退出后内部状态可能已损坏）
+            try:
+                self.ws_client = lark.ws.Client(
+                    config.FEISHU_APP_ID,
+                    config.FEISHU_APP_SECRET,
+                    event_handler=event_handler,
+                    log_level=lark.LogLevel.INFO,
+                )
+            except Exception as e:
+                logging.getLogger('Lark').error(f"重建 WebSocket 客户端失败: {e}")
+                continue
 
     def _signal_handler(self, signum, frame):
         """处理退出信号（SIGTERM / SIGINT）"""

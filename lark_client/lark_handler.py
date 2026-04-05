@@ -87,6 +87,10 @@ class LarkHandler:
         self._detached_slices: Dict[str, CardSlice] = {}
         # 正在启动中的会话名集合（防止并发点击触发竞态）
         self._starting_sessions: set = set()
+        # 正在自动重连中的 chat_id 集合（防止并发重连）
+        self._reconnecting: set = set()
+        # 是否已执行启动恢复
+        self._restored: bool = False
 
     # ── 持久化绑定 ──────────────────────────────────────────────────────────
 
@@ -139,6 +143,9 @@ class LarkHandler:
     async def _attach(self, chat_id: str, session_name: str,
                       user_id: Optional[str] = None) -> bool:
         """统一 attach 逻辑（私聊/群聊共用）"""
+        # 取消正在进行的自动重连
+        self._reconnecting.discard(chat_id)
+
         # 在断开旧连接之前，先更新旧流式卡片为已断开状态
         old_session = self._chat_sessions.get(chat_id)
         old_slice = self._poller.stop_and_get_active_slice(chat_id)
@@ -169,6 +176,9 @@ class LarkHandler:
 
     async def _detach(self, chat_id: str):
         """统一 detach 逻辑（私聊/群聊共用）"""
+        # 取消正在进行的自动重连
+        self._reconnecting.discard(chat_id)
+
         bridge = self._bridges.pop(chat_id, None)
         if bridge:
             await bridge.disconnect()
@@ -176,27 +186,78 @@ class LarkHandler:
         self._poller.stop(chat_id)
 
     async def _on_disconnect(self, chat_id: str, session_name: str):
-        """服务端关闭连接时的统一处理"""
+        """服务端关闭连接时：尝试自动重连，全部失败后才标记断开"""
         logger.info(f"会话 '{session_name}' 断线, chat_id={chat_id[:8]}...")
         _track_stats('lark', 'disconnect', session_name=session_name,
                      chat_id=chat_id)
-        active_slice = self._poller.stop_and_get_active_slice(chat_id)
+
+        # 清理旧 bridge（保留 poller 运行、保留 binding）
         self._bridges.pop(chat_id, None)
-        self._chat_sessions.pop(chat_id, None)
-        self._detached_slices.pop(chat_id, None)
-        self._remove_binding_by_chat(chat_id)
 
-        if active_slice:
-            await self._update_card_disconnected(chat_id, session_name, active_slice)
+        # 防止并发重连（同一 chat_id 只允许一个重连流程）
+        if chat_id in self._reconnecting:
+            return
+        self._reconnecting.add(chat_id)
 
-        # 会话退出时自动解散绑定到该会话的所有专属群聊
-        await self._disband_groups_for_session(session_name, source="disconnect")
+        MAX_RETRIES = 5
+        try:
+            for attempt in range(1, MAX_RETRIES + 1):
+                await asyncio.sleep(min(attempt, 3))  # 1s, 2s, 3s, 3s, 3s
+
+                # 被外部取消（用户 detach/attach 了其他会话）
+                if chat_id not in self._reconnecting:
+                    return
+
+                # 会话是否还在
+                sessions = list_active_sessions()
+                if not any(s["name"] == session_name for s in sessions):
+                    logger.info(f"会话 '{session_name}' 已不存在，停止重连")
+                    break
+
+                logger.info(f"自动重连 ({attempt}/{MAX_RETRIES}): session={session_name}, chat_id={chat_id[:8]}...")
+
+                # 直接创建新 bridge（不经过 _attach，保持 poller 不中断）
+                def _make_on_disconnect(cid=chat_id, sn=session_name):
+                    def cb():
+                        asyncio.create_task(self._on_disconnect(cid, sn))
+                    return cb
+
+                bridge = SessionBridge(session_name, on_disconnect=_make_on_disconnect())
+                if await bridge.connect():
+                    self._bridges[chat_id] = bridge
+                    self._chat_sessions[chat_id] = session_name
+                    logger.info(f"自动重连成功: session={session_name}, chat_id={chat_id[:8]}...")
+                    return
+
+            # ── 全部重连失败，执行清理 ──
+            logger.warning(f"自动重连失败 ({MAX_RETRIES} 次): session={session_name}, chat_id={chat_id[:8]}...")
+            active_slice = self._poller.stop_and_get_active_slice(chat_id)
+            self._chat_sessions.pop(chat_id, None)
+            self._detached_slices.pop(chat_id, None)
+
+            if active_slice:
+                await self._update_card_disconnected(chat_id, session_name, active_slice)
+
+            # 只在会话确实不存在时才移除非群聊绑定
+            # 群聊不解散：保留群和绑定，下次同名会话启动时自动恢复
+            sessions = list_active_sessions()
+            session_gone = not any(s["name"] == session_name for s in sessions)
+            if session_gone:
+                self._remove_binding_by_chat(chat_id)
+            # 否则保留 binding，下次交互时 _ensure_bridge 可恢复
+        finally:
+            self._reconnecting.discard(chat_id)
 
     # ── 消息入口 ────────────────────────────────────────────────────────────
 
     async def handle_message(self, user_id: str, chat_id: str, text: str,
                               chat_type: str = "p2p"):
         """处理用户消息（群聊/私聊统一路由）"""
+        # 首次收到消息时触发启动恢复（恢复所有持久化绑定）
+        if not self._restored:
+            self._restored = True
+            asyncio.create_task(self._restore_bindings())
+
         logger.info(f"收到消息: user={user_id[:8]}..., chat={chat_id[:8]}..., type={chat_type}, text={text[:50]}")
         text = text.strip()
 
@@ -211,7 +272,13 @@ class LarkHandler:
                                  chat_id=chat_id)
             else:
                 await self._handle_command(user_id, chat_id, text)
-        # else: 普通聊天消息（无 /cl 前缀），不再转发给 Claude
+        elif chat_id in self._group_chat_ids:
+            # 专属群聊中的普通消息直接转发给 Claude（无需 /cl 前缀）
+            await self._forward_to_claude(user_id, chat_id, text)
+            _track_stats('lark', 'message',
+                         session_name=self._chat_sessions.get(chat_id, ''),
+                         chat_id=chat_id)
+        # else: 非专属群聊/私聊的普通消息不转发
 
     async def forward_to_claude(self, user_id: str, chat_id: str, text: str):
         """卡片输入框直通 Claude（跳过命令路由）"""
@@ -274,6 +341,8 @@ class LarkHandler:
         if ok:
             self._chat_bindings[chat_id] = session_name
             self._save_chat_bindings()
+            # 自动恢复绑定到此会话的已有群聊
+            await self._reattach_session_groups(session_name, user_id=user_id)
             if message_id:
                 await self._cmd_list(user_id, chat_id, message_id=message_id)
         else:
@@ -395,6 +464,8 @@ class LarkHandler:
             if ok:
                 self._chat_bindings[chat_id] = session_name
                 self._save_chat_bindings()
+                # 自动恢复绑定到此会话的已有群聊
+                await self._reattach_session_groups(session_name, user_id=user_id)
             else:
                 await card_service.send_text(
                     chat_id,
@@ -718,7 +789,7 @@ class LarkHandler:
 
     async def _cmd_new_group(self, user_id: str, chat_id: str, args: str,
                               message_id: Optional[str] = None):
-        """创建专属群聊并绑定 Claude 会话"""
+        """创建专属群聊并绑定 Claude 会话（已有群聊时复用）"""
         session_name = args.strip()
         if not session_name:
             await card_service.send_text(chat_id, "用法：/new-group <会话名>\n示例：/new-group myapp")
@@ -728,6 +799,25 @@ class LarkHandler:
         if not any(s["name"] == session_name for s in sessions):
             await card_service.send_text(chat_id, f"会话 '{session_name}' 不存在，请先 /start 启动")
             return
+
+        # 检查是否已有群聊绑定到此会话 → 复用
+        existing_group_id = next(
+            (cid for cid in self._group_chat_ids
+             if self._chat_bindings.get(cid) == session_name),
+            None,
+        )
+        if existing_group_id:
+            logger.info(f"复用已有群聊: chat_id={existing_group_id[:8]}..., session={session_name}")
+            ok = await self._attach(existing_group_id, session_name, user_id=user_id)
+            if ok:
+                await self._cmd_list(user_id, chat_id, message_id=message_id)
+                return
+            # 复用失败（群可能已被手动解散）→ 清理后走创建流程
+            logger.warning(f"复用群聊失败，清理并创建新群: chat_id={existing_group_id[:8]}...")
+            self._group_chat_ids.discard(existing_group_id)
+            self._chat_bindings.pop(existing_group_id, None)
+            self._save_group_chat_ids()
+            self._save_chat_bindings()
 
         session = next((s for s in sessions if s["name"] == session_name), None)
         pid = session.get("pid") if session else None
@@ -881,34 +971,87 @@ class LarkHandler:
             logger.error(f"解散群失败: {e}")
             await card_service.send_text(chat_id, f"解散群失败：{e}")
 
+    # ── 连接恢复 ─────────────────────────────────────────────────────────────
+
+    async def _restore_bindings(self):
+        """启动后自动恢复所有持久化绑定（后台运行，不阻塞消息处理）"""
+        sessions = list_active_sessions()
+        active_names = {s["name"] for s in sessions}
+        restored = 0
+
+        for chat_id, session_name in list(self._chat_bindings.items()):
+            if session_name not in active_names:
+                continue
+            if chat_id in self._bridges and self._bridges[chat_id].running:
+                continue  # 已连接
+
+            logger.info(f"启动恢复: chat_id={chat_id[:8]}..., session={session_name}")
+            try:
+                ok = await self._attach(chat_id, session_name)
+                if ok:
+                    restored += 1
+                    # 恢复绑定（_attach 不会自动更新 _chat_bindings）
+                    self._chat_bindings[chat_id] = session_name
+                else:
+                    logger.warning(f"启动恢复失败: session={session_name}")
+            except Exception as e:
+                logger.warning(f"启动恢复异常: session={session_name}, {e}")
+
+        if restored:
+            logger.info(f"启动恢复完成: {restored} 个绑定已恢复")
+
+    async def _reattach_session_groups(self, session_name: str,
+                                        user_id: Optional[str] = None) -> None:
+        """重新连接绑定到指定会话的所有专属群聊（会话启动/attach 后调用）"""
+        for cid in list(self._group_chat_ids):
+            if self._chat_bindings.get(cid) != session_name:
+                continue
+            if cid in self._bridges and self._bridges[cid].running:
+                continue  # 已连接
+            logger.info(f"自动恢复群聊: chat_id={cid[:8]}..., session={session_name}")
+            try:
+                ok = await self._attach(cid, session_name, user_id=user_id)
+                if ok:
+                    logger.info(f"群聊恢复成功: chat_id={cid[:8]}...")
+                else:
+                    logger.warning(f"群聊恢复失败: chat_id={cid[:8]}...")
+            except Exception as e:
+                logger.warning(f"群聊恢复异常: chat_id={cid[:8]}..., {e}")
+
+    async def _ensure_bridge(self, chat_id: str, user_id: Optional[str] = None) -> Optional['SessionBridge']:
+        """确保 bridge 可用，必要时从持久化绑定自动恢复。返回可用 bridge 或 None。"""
+        bridge = self._bridges.get(chat_id)
+        if bridge and bridge.running:
+            return bridge
+
+        # 尝试从持久化绑定自动恢复
+        saved_session = self._chat_bindings.get(chat_id)
+        if not saved_session:
+            await card_service.send_text(
+                chat_id, "未连接到任何会话，请先使用 /attach <会话名> 连接"
+            )
+            return None
+
+        logger.info(f"自动恢复绑定: chat_id={chat_id[:8]}..., session={saved_session}")
+        ok = await self._attach(chat_id, saved_session, user_id=user_id)
+        if not ok:
+            self._group_chat_ids.discard(chat_id)
+            self._save_group_chat_ids()
+            self._remove_binding_by_chat(chat_id, force=True)
+            await card_service.send_text(
+                chat_id, f"会话 '{saved_session}' 已不存在，请重新 /attach"
+            )
+            # 会话已不存在，解散绑定到该会话的所有专属群聊
+            await self._disband_groups_for_session(saved_session, source="lazy")
+            return None
+
+        return self._bridges.get(chat_id)
+
     # ── 消息转发 ─────────────────────────────────────────────────────────────
 
     async def _forward_to_claude(self, user_id: str, chat_id: str, text: str):
         """转发消息给 Claude（输出由 SharedMemoryPoller 自动推卡片）"""
-        bridge = self._bridges.get(chat_id)
-
-        if not bridge or not bridge.running:
-            # 尝试从持久化绑定自动恢复
-            saved_session = self._chat_bindings.get(chat_id)
-            if saved_session:
-                logger.info(f"自动恢复绑定: chat_id={chat_id[:8]}..., session={saved_session}")
-                ok = await self._attach(chat_id, saved_session, user_id=user_id)
-                if not ok:
-                    self._group_chat_ids.discard(chat_id)
-                    self._save_group_chat_ids()
-                    self._remove_binding_by_chat(chat_id, force=True)
-                    await card_service.send_text(
-                        chat_id, f"会话 '{saved_session}' 已不存在，请重新 /attach"
-                    )
-                    # 会话已不存在，解散绑定到该会话的所有专属群聊
-                    await self._disband_groups_for_session(saved_session, source="lazy")
-                    return
-                bridge = self._bridges.get(chat_id)
-            else:
-                await card_service.send_text(
-                    chat_id, "未连接到任何会话，请先使用 /attach <会话名> 连接"
-                )
-                return
+        bridge = await self._ensure_bridge(chat_id, user_id=user_id)
 
         if not bridge:
             return
@@ -932,9 +1075,8 @@ class LarkHandler:
                      session_name=self._chat_sessions.get(chat_id, ''),
                      chat_id=chat_id, detail=option_value)
 
-        bridge = self._bridges.get(chat_id)
-        if not bridge or not bridge.running:
-            await card_service.send_text(chat_id, "未连接到任何会话，请先使用 /attach <会话名> 连接")
+        bridge = await self._ensure_bridge(chat_id, user_id=user_id)
+        if not bridge:
             return
 
         target = option_value  # 目标选项 value（如 "2"）
@@ -1051,9 +1193,8 @@ class LarkHandler:
             logger.warning(f"未知快捷键: {key_name}")
             return
 
-        bridge = self._bridges.get(chat_id)
-        if not bridge or not bridge.running:
-            logger.warning(f"send_raw_key: chat_id={chat_id[:8]}... 未连接会话")
+        bridge = await self._ensure_bridge(chat_id, user_id=user_id)
+        if not bridge:
             return
 
         success = await bridge.send_raw(raw)
